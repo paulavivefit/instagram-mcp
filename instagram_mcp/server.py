@@ -41,6 +41,7 @@ from typing import Any
 from fastmcp import FastMCP
 
 from instagram_mcp import audit, auth, graph_client
+from instagram_mcp import insights_metrics as IM
 from instagram_mcp import validators as V
 
 mcp = FastMCP("instagram-mcp")
@@ -52,13 +53,7 @@ MEDIA_FIELDS = ("id,caption,media_type,media_product_type,media_url,permalink,"
                 "thumbnail_url,timestamp,username,like_count,comments_count")
 COMMENT_FIELDS = "id,text,username,timestamp,like_count,hidden"
 
-# Insight metric defaults vary by Graph API version; these are sensible defaults
-# and every insights tool accepts a `metrics`/`period` override so the caller can
-# adapt to whatever the live API wants. A version mismatch returns Meta's own
-# error (which names the right metric) rather than failing opaquely.
-DEFAULT_ACCOUNT_METRICS = "reach,impressions,profile_views,follower_count"
-DEFAULT_MEDIA_METRICS = "reach,saved,likes,comments,shares,total_interactions"
-DEFAULT_AUDIENCE_METRIC = "follower_demographics"
+# Insight metric names live in insights_metrics.py (version-sensitive).
 
 
 # --------------------------------- plumbing --------------------------------- #
@@ -276,35 +271,74 @@ def get_media(media_id: str, account: str | None = None) -> dict[str, Any]:
 @mcp.tool()
 def get_account_insights(account: str | None = None, *, metrics: str | None = None,
                          period: str = "day") -> dict[str, Any]:
-    """Account-level analytics (reach, impressions, profile views, follower count).
+    """Account-level analytics.
 
-    metrics: comma-separated Graph metric names (default reach,impressions,profile_views,
-    follower_count). period: day|week|days_28|lifetime. Exact available metrics vary by
-    Graph API version; on a mismatch the Meta error names the correct metric.
+    metrics: comma-separated Graph metric names. Default: reach, follower_count (time
+    series) + views, profile_views, accounts_engaged, total_interactions (totals).
+    Time-series metrics (reach, follower_count, online_followers) use `period`
+    (day|week|days_28); all other metrics are fetched as metric_type=total_value,
+    which Meta only accepts with period=day. Results are merged; if one group fails
+    the other is still returned with an `errors` list.
     """
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
-        m = metrics or DEFAULT_ACCOUNT_METRICS
+        names = IM.parse_metric_list(metrics, IM.DEFAULT_ACCOUNT_METRICS)
         per = V.validate_enum(period, {"day", "week", "days_28", "lifetime"}, field="period", default="day")
-        data = client.get(f"{acct.ig_user_id}/insights", metric=m, period=per)
-        return {"ok": True, "account": acct.label, "period": per, "insights": data.get("data", [])}
+        ts, tv = IM.split_account_metrics(names)
+        groups = []
+        if ts:
+            groups.append(({"metric": ",".join(ts), "period": per}, ts))
+        if tv:
+            groups.append(({"metric": ",".join(tv), "period": IM.TOTAL_VALUE_PERIOD,
+                            "metric_type": "total_value"}, tv))
+        insights: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for params, group in groups:
+            try:
+                insights.extend(client.get(f"{acct.ig_user_id}/insights", **params).get("data", []))
+            except graph_client.GraphAPIError as exc:
+                errors.append({"metrics": group, "error": audit.sanitize_error(str(exc)),
+                               "error_class": exc.error_class})
+        if not insights and errors:
+            raise graph_client.GraphAPIError(errors[0]["error"], error_class=errors[0]["error_class"])
+        out: dict[str, Any] = {"ok": True, "account": acct.label, "period": per, "insights": insights}
+        if errors:
+            out["errors"] = errors
+        return out
     return _guard("get_account_insights", {"account": account, "metrics": metrics, "period": period}, _impl)
 
 
 @mcp.tool()
 def get_media_insights(media_id: str, account: str | None = None, *, metrics: str | None = None) -> dict[str, Any]:
-    """Per-post analytics (reach, saves, likes, comments, shares, total interactions).
+    """Per-post analytics. Picks the right default metrics for the post type.
 
-    metrics override is comma-separated; defaults suit feed posts. Reels/stories expose
-    different metrics (e.g. plays, navigation) — pass them explicitly if needed.
+    Feed posts/carousels: reach, likes, comments, shares, saved, total_interactions, views.
+    Reels add ig_reels_avg_watch_time + ig_reels_video_view_total_time. Stories: reach,
+    views, replies, shares, total_interactions. Pass `metrics` (comma-separated) to override.
     """
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         mid = V.validate_graph_id(media_id, field="media_id")
-        m = metrics or DEFAULT_MEDIA_METRICS
-        data = client.get(f"{mid}/insights", metric=m)
-        return {"ok": True, "account": acct.label, "media_id": mid, "insights": data.get("data", [])}
+        product = None
+        if metrics:
+            names = IM.parse_metric_list(metrics, ())
+        else:
+            info = client.get(mid, fields="media_product_type,media_type")
+            product = info.get("media_product_type")
+            names = list(IM.media_metrics_for(product))
+        data = client.get(f"{mid}/insights", metric=",".join(names))
+        out: dict[str, Any] = {"ok": True, "account": acct.label, "media_id": mid,
+                               "insights": data.get("data", [])}
+        if product:
+            out["media_product_type"] = product
+        return out
     return _guard("get_media_insights", {"media_id": media_id, "account": account, "metrics": metrics}, _impl)
+
+
+AUDIENCE_HINT = ("Meta returns this when demographics are unavailable: the account needs "
+                 ">=100 followers, and only one breakdown per request is allowed. Try a single "
+                 "breakdown (age|gender|country|city) or, for engaged_audience_demographics, a "
+                 "timeframe (this_week|this_month).")
 
 
 @mcp.tool()
@@ -312,26 +346,40 @@ def get_audience_insights(account: str | None = None, *, metric: str | None = No
                           period: str = "lifetime", metric_type: str = "total_value",
                           breakdown: str | None = "age,gender,country,city",
                           timeframe: str | None = None) -> dict[str, Any]:
-    """Follower demographics (age, gender, country, city).
+    """Follower demographics by age, gender, country and city.
 
-    Requires the account to have >=100 followers (Meta privacy floor) — below that the
-    Graph returns an error, surfaced cleanly. Newer Graph versions use metric=
-    follower_demographics with metric_type=total_value + breakdown=age|gender|country|city
-    and a timeframe (last_14_days|last_30_days|last_90_days|prev_month) for engaged-audience
-    metrics. All are override-able.
+    Meta allows ONE breakdown per request, so each breakdown in `breakdown`
+    (comma-separated, default all four) is fetched separately and merged into
+    `breakdowns: {age: ..., gender: ...}`. metric: follower_demographics (default) or
+    engaged_audience_demographics (pass timeframe=this_week|this_month for that one).
+    Needs >=100 followers (Meta privacy floor).
     """
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
-        m = metric or DEFAULT_AUDIENCE_METRIC
-        params: dict[str, Any] = {"metric": m, "period": period, "metric_type": metric_type}
-        if breakdown:
-            params["breakdown"] = breakdown
-        if timeframe:
-            params["timeframe"] = timeframe
-        data = client.get(f"{acct.ig_user_id}/insights", **params)
-        return {"ok": True, "account": acct.label, "metric": m, "insights": data.get("data", [])}
+        m = metric or IM.DEFAULT_AUDIENCE_METRIC
+        dims = IM.parse_metric_list(breakdown, IM.AUDIENCE_BREAKDOWNS)
+        result: dict[str, Any] = {}
+        errors: list[dict[str, Any]] = []
+        for dim in dims:
+            params: dict[str, Any] = {"metric": m, "period": period, "metric_type": metric_type,
+                                      "breakdown": dim, "timeframe": timeframe}
+            try:
+                result[dim] = client.get(f"{acct.ig_user_id}/insights", **params).get("data", [])
+            except graph_client.GraphAPIError as exc:
+                errors.append({"breakdown": dim, "error": audit.sanitize_error(str(exc)),
+                               "error_class": exc.error_class})
+        if not result:
+            return {"ok": False, "account": acct.label, "metric": m,
+                    "error": errors[0]["error"] if errors else "no breakdowns requested",
+                    "error_class": errors[0]["error_class"] if errors else "validation",
+                    "errors": errors, "hint": AUDIENCE_HINT}
+        out: dict[str, Any] = {"ok": True, "account": acct.label, "metric": m, "breakdowns": result}
+        if errors:
+            out["errors"] = errors
+            out["hint"] = AUDIENCE_HINT
+        return out
     return _guard("get_audience_insights",
-                  {"account": account, "metric": metric, "period": period}, _impl)
+                  {"account": account, "metric": metric, "period": period, "breakdown": breakdown}, _impl)
 
 
 # =============================== PUBLISHING =============================== #
