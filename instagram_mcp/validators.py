@@ -80,7 +80,78 @@ def validate_caption(value: str | None, *, field: str = "caption") -> str | None
         raise ValidationError(f"{field} must be a string")
     if len(value) > CAPTION_MAX:
         raise ValidationError(f"{field} exceeds Instagram's {CAPTION_MAX}-char limit (got {len(value)})")
+    tags = len(_HASHTAG_IN_TEXT.findall(value))
+    if tags > MAX_CAPTION_HASHTAGS:
+        raise ValidationError(f"{field} has {tags} hashtags; Instagram allows at most {MAX_CAPTION_HASHTAGS}")
+    mentions = len(_MENTION_IN_TEXT.findall(value))
+    if mentions > MAX_CAPTION_MENTIONS:
+        raise ValidationError(f"{field} has {mentions} @mentions; Instagram allows at most {MAX_CAPTION_MENTIONS}")
     return value
+
+
+MAX_CAPTION_HASHTAGS = 30
+MAX_CAPTION_MENTIONS = 20
+MAX_USER_TAGS = 20
+MAX_COLLABORATORS = 3
+ALT_TEXT_MAX = 1000
+_HASHTAG_IN_TEXT = re.compile(r"(?<![\w&])#\w+")
+_MENTION_IN_TEXT = re.compile(r"(?<![\w.])@[A-Za-z0-9._]+")
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+
+
+def validate_alt_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > ALT_TEXT_MAX:
+        raise ValidationError(f"alt_text must be text of at most {ALT_TEXT_MAX} characters")
+    return value
+
+
+def validate_user_tags(value: Any, *, require_xy: bool = True) -> str | None:
+    """[{username, x, y}] -> JSON string for the Graph API. x/y are 0..1 (image only)."""
+    import json
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise ValidationError("user_tags must be a non-empty list of {username, x, y}")
+    if len(value) > MAX_USER_TAGS:
+        raise ValidationError(f"user_tags allows at most {MAX_USER_TAGS} people")
+    out = []
+    for tag in value:
+        if not isinstance(tag, dict) or not _USERNAME_RE.match(str(tag.get("username", ""))):
+            raise ValidationError("each user_tag needs a valid Instagram username")
+        item: dict[str, Any] = {"username": tag["username"]}
+        if require_xy or "x" in tag or "y" in tag:
+            for axis in ("x", "y"):
+                v = tag.get(axis)
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1:
+                    raise ValidationError(f"user_tag {axis} must be a number between 0 and 1")
+                item[axis] = v
+        out.append(item)
+    return json.dumps(out)
+
+
+def validate_collaborators(value: Any) -> str | None:
+    import json
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = [v.strip() for v in value.split(",") if v.strip()]
+    if not isinstance(value, list) or not value or len(value) > MAX_COLLABORATORS:
+        raise ValidationError(f"collaborators must be 1-{MAX_COLLABORATORS} Instagram usernames")
+    for u in value:
+        if not isinstance(u, str) or not _USERNAME_RE.match(u.lstrip("@")):
+            raise ValidationError(f"collaborator {u!r} is not a valid Instagram username")
+    return json.dumps([u.lstrip("@") for u in value])
+
+
+def validate_location_id(value: str | int | None) -> str | None:
+    if value is None or value == "":
+        return None
+    v = str(value).strip()
+    if not v.isdigit() or len(v) > 30:
+        raise ValidationError("location_id must be a numeric Facebook location/Page id")
+    return v
 
 
 def validate_hashtag(value: str, *, field: str = "hashtag") -> str:
