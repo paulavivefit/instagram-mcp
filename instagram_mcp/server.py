@@ -52,6 +52,9 @@ PROFILE_FIELDS = ("id,username,name,biography,followers_count,follows_count,"
 MEDIA_FIELDS = ("id,caption,media_type,media_product_type,media_url,permalink,"
                 "thumbnail_url,timestamp,username,like_count,comments_count")
 COMMENT_FIELDS = "id,text,username,timestamp,like_count,hidden"
+COMMENT_WITH_REPLIES_FIELDS = COMMENT_FIELDS + ",replies{" + COMMENT_FIELDS + "}"
+CHILD_FIELDS = "children{id,media_type,media_url,thumbnail_url,permalink,timestamp}"
+STORY_FIELDS = "id,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp,caption"
 
 # Insight metric names live in insights_metrics.py (version-sensitive).
 
@@ -312,11 +315,15 @@ def list_media(account: str | None = None, *, limit: int | str = 25, after: str 
 
 @mcp.tool()
 def get_media(media_id: str, account: str | None = None) -> dict[str, Any]:
-    """Return full fields for one media object by id (caption, type, permalink, like/comment counts)."""
+    """Full fields for one post (caption, type, permalink, like/comment counts).
+
+    Carousels also return `children` (each image/video with its own media_url).
+    """
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         mid = V.validate_graph_id(media_id, field="media_id")
-        return {"ok": True, "account": acct.label, "media": client.get(mid, fields=MEDIA_FIELDS)}
+        return {"ok": True, "account": acct.label,
+                "media": client.get(mid, fields=MEDIA_FIELDS + "," + CHILD_FIELDS)}
     return _guard("get_media", {"media_id": media_id, "account": account}, _impl)
 
 
@@ -475,6 +482,52 @@ def _metric_value(row: dict[str, Any]) -> Any:
     return vals[0].get("value") if vals else None
 
 
+def _batch_media_insights(client: graph_client.GraphClient, posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fetch insights for many posts via Graph batch requests (50 per call).
+
+    Sets post["metrics"] = {name: value} on success; returns per-post errors.
+    """
+    import json
+    errors: list[dict[str, Any]] = []
+    for i in range(0, len(posts), 50):
+        chunk = posts[i:i + 50]
+        batch = [{"method": "GET", "relative_url": f"{p['id']}/insights?metric="
+                  + ",".join(IM.media_metrics_for(p.get("media_product_type")))} for p in chunk]
+        replies = client.post("", batch=json.dumps(batch), include_headers="false").get("data") or []
+        for post, reply in zip(chunk, replies, strict=False):
+            try:
+                body = json.loads((reply or {}).get("body") or "{}")
+            except ValueError:
+                body = {}
+            if (reply or {}).get("code") != 200 or "error" in body:
+                msg = ((body.get("error") or {}).get("message")) or "insights unavailable"
+                errors.append({"id": post["id"], "error": audit.sanitize_error(msg)})
+                continue
+            post["metrics"] = {row["name"]: _metric_value(row) for row in body.get("data", [])}
+    return errors
+
+
+@mcp.tool()
+def list_stories(account: str | None = None, *, include_insights: bool = False) -> dict[str, Any]:
+    """Currently active stories (last 24 h) with media URLs and permalinks.
+
+    include_insights=True adds reach, views, replies, shares, total_interactions per story.
+    Story insights disappear after 24 h, so fetch them while the story is live.
+    """
+    def _impl() -> dict[str, Any]:
+        client, acct = auth.client_for(account)
+        stories = client.get(f"{acct.ig_user_id}/stories", fields=STORY_FIELDS).get("data") or []
+        for st in stories:
+            st.setdefault("media_product_type", "STORY")
+        out: dict[str, Any] = {"ok": True, "account": acct.label, "count": len(stories), "stories": stories}
+        if include_insights and stories:
+            errors = _batch_media_insights(client, stories)
+            if errors:
+                out["errors"] = errors
+        return out
+    return _guard("list_stories", {"account": account, "include_insights": include_insights}, _impl)
+
+
 @mcp.tool()
 def top_posts(account: str | None = None, *, since: str | None = None, until: str | None = None,
               metric: str = "reach", n: int = 10, media_type: str | None = None) -> dict[str, Any]:
@@ -486,7 +539,6 @@ def top_posts(account: str | None = None, *, since: str | None = None, until: st
     batch requests (50 posts per call) to save rate limit.
     """
     def _impl() -> dict[str, Any]:
-        import json
         from datetime import timedelta
         client, acct = auth.client_for(account)
         if metric not in SORT_METRICS:
@@ -508,22 +560,7 @@ def top_posts(account: str | None = None, *, since: str | None = None, until: st
         if kind:
             posts = [p for p in posts if kind in {(p.get("media_product_type") or "").upper(),
                                                    (p.get("media_type") or "").upper()}]
-        errors: list[dict[str, Any]] = []
-        for i in range(0, len(posts), 50):
-            chunk = posts[i:i + 50]
-            batch = [{"method": "GET", "relative_url": f"{p['id']}/insights?metric="
-                      + ",".join(IM.media_metrics_for(p.get("media_product_type")))} for p in chunk]
-            replies = client.post("", batch=json.dumps(batch), include_headers="false").get("data") or []
-            for post, reply in zip(chunk, replies, strict=False):
-                try:
-                    body = json.loads((reply or {}).get("body") or "{}")
-                except ValueError:
-                    body = {}
-                if (reply or {}).get("code") != 200 or "error" in body:
-                    msg = ((body.get("error") or {}).get("message")) or "insights unavailable"
-                    errors.append({"id": post["id"], "error": audit.sanitize_error(msg)})
-                    continue
-                post["metrics"] = {row["name"]: _metric_value(row) for row in body.get("data", [])}
+        errors = _batch_media_insights(client, posts)
         ranked = sorted((p for p in posts if "metrics" in p),
                         key=lambda p: p["metrics"].get(metric) or -1, reverse=True)[:top_n]
         result = [{"id": p["id"], "timestamp": p.get("timestamp"), "permalink": p.get("permalink"),
@@ -802,19 +839,39 @@ def publish_story(image_url: str | None = None, video_url: str | None = None,
 
 @mcp.tool()
 def get_comments(media_id: str, account: str | None = None, *, limit: int | str = 25,
-                 after: str | None = None) -> dict[str, Any]:
-    """List comments on a post (text, username, timestamp, like_count, hidden).
+                 after: str | None = None, include_replies: bool = False) -> dict[str, Any]:
+    """List top-level comments on a post (text, username, timestamp, like_count, hidden).
 
-    limit: 1-5000 or "all". Returns next_cursor when more comments exist.
+    limit: 1-5000 or "all". include_replies=True also returns each comment's replies
+    (for a very long thread use get_comment_replies). Note: Meta's comments_count on a
+    post also counts comments the API does not return (e.g. hidden/restricted).
     """
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         mid = V.validate_graph_id(media_id, field="media_id")
         lim = V.validate_limit(limit, ceiling=CEIL_COMMENTS, all_ceiling=CEIL_COMMENTS)
-        items, cursor = client.paginate(f"{mid}/comments", fields=COMMENT_FIELDS, max_items=lim,
+        fields = COMMENT_WITH_REPLIES_FIELDS if include_replies else COMMENT_FIELDS
+        items, cursor = client.paginate(f"{mid}/comments", fields=fields, max_items=lim,
                                         after=V.validate_cursor(after))
-        return _paged({"ok": True, "account": acct.label, "media_id": mid}, items, cursor, "comments")
+        out = _paged({"ok": True, "account": acct.label, "media_id": mid}, items, cursor, "comments")
+        if include_replies:
+            out["reply_count"] = sum(len((c.get("replies") or {}).get("data") or []) for c in items)
+        return out
     return _guard("get_comments", {"media_id": media_id, "account": account, "limit": limit}, _impl)
+
+
+@mcp.tool()
+def get_comment_replies(comment_id: str, account: str | None = None, *, limit: int | str = 50,
+                        after: str | None = None) -> dict[str, Any]:
+    """List replies under one comment. limit 1-5000 or "all"; returns next_cursor if more."""
+    def _impl() -> dict[str, Any]:
+        client, acct = auth.client_for(account)
+        cid = V.validate_graph_id(comment_id, field="comment_id")
+        lim = V.validate_limit(limit, default=50, ceiling=CEIL_COMMENTS, all_ceiling=CEIL_COMMENTS)
+        items, cursor = client.paginate(f"{cid}/replies", fields=COMMENT_FIELDS, max_items=lim,
+                                        after=V.validate_cursor(after))
+        return _paged({"ok": True, "account": acct.label, "comment_id": cid}, items, cursor, "replies")
+    return _guard("get_comment_replies", {"comment_id": comment_id, "account": account, "limit": limit}, _impl)
 
 
 @mcp.tool()
