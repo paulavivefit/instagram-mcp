@@ -4,7 +4,7 @@
 
 An [MCP](https://modelcontextprotocol.io) server for the **official Instagram Graph API**. Read, publish, comment, and pull analytics across one or many Instagram **Business/Creator** accounts from Claude (or any MCP client) — ToS-safe, no private/reverse-engineered API.
 
-29 tools across accounts, media, publishing, insights, comments, discovery, and (review-gated) direct messages.
+35 tools across accounts, media, publishing, insights, comments, discovery, and (review-gated) direct messages.
 
 ```
 npx-style stdio MCP · Python · FastMCP · MIT
@@ -59,19 +59,21 @@ Or skip the env vars and call `add_account` at runtime (token goes to your OS ke
 
 ## Tools
 
-**Accounts & health** — `healthcheck`, `list_accounts`, `add_account`, `set_default_account`, `remove_account`, `account_info`
+**Accounts & health** — `healthcheck` (incl. Meta rate-limit usage), `list_accounts`, `add_account`, `set_default_account`, `remove_account`, `account_info`
 
-**Profile & media** — `get_profile`, `list_media`, `get_media`
+**Profile & media** — `get_profile`, `list_media` (`limit` up to 10 000 or `"all"`, `since`/`until` dates, `next_cursor` paging), `get_media` (incl. carousel children), `list_stories` (active stories, optional insights)
 
-**Insights** — `get_account_insights` (reach, impressions, profile views, follower count), `get_media_insights` (per-post reach, saves, shares, interactions), `get_audience_insights` (follower demographics: age, gender, country, city)
+**Insights** — `get_account_insights` (reach, views, profile views, accounts engaged, interactions, follower count; any date range, split into Meta's 30-day windows), `get_media_insights` (right metrics per feed post / reel / story), `get_audience_insights` (age, gender, country, city), `top_posts` (rank posts in a range by reach/views/likes/…, batched), `insights_summary` (last 7/30/90 days vs the period before)
 
-**Publishing** — `publish_image`, `publish_video`, `publish_reel`, `publish_carousel` (2–10 images), `publish_story`, `publishing_limit` (remaining 24h quota). Video/reel containers process asynchronously; the server polls to completion before publishing.
+**Publishing** — `publish_image` (alt text, user tags, location, collaborators), `publish_video`, `publish_reel` (cover/thumb offset, collaborators, audio name, location), `publish_carousel` (2–10 images and/or videos), `publish_story`, `publish_container` (finish a video that was still processing), `publishing_limit`. Captions are checked for Instagram's limits (2200 chars, 30 hashtags, 20 mentions) before anything is sent.
 
-**Comments** — `get_comments`, `reply_to_comment`, `hide_comment`, `delete_comment`
+**Comments** — `get_comments` (`"all"`, optional replies), `get_comment_replies`, `reply_to_comment`, `hide_comment`, `delete_comment`
 
-**Discovery** — `search_hashtag`, `get_hashtag_media`, `get_mentions`, `business_discovery` (read any public Professional account by username)
+**Discovery** — `search_hashtag`, `get_hashtag_media`, `get_mentions`, `business_discovery` (any public Professional account, up to 500 posts)
 
-**Direct messages** — `list_conversations`, `get_messages`, `send_message` (see below)
+**Direct messages** — `list_conversations`, `get_messages` (text, attachments, shares, story replies), `send_message` (text and/or image, optional `HUMAN_AGENT` tag), `mark_seen` (see below)
+
+**Reliability** — automatic retries with backoff for slow or rate-limited Meta responses (a timed-out publish or send is never repeated), 60 s request timeout, 5 min video processing wait. Knobs: `INSTAGRAM_MCP_TIMEOUT`, `INSTAGRAM_MCP_MAX_ATTEMPTS`, `INSTAGRAM_MCP_VIDEO_WAIT_S`, `INSTAGRAM_MCP_GRAPH_VERSION` (default `v27.0`).
 
 > Publishing takes **public https media URLs** — Instagram fetches the bytes itself, so the image/video must be reachable on the open web (an S3/Cloudflare/any-CDN URL works).
 
@@ -90,7 +92,7 @@ Tokens are stored in the **macOS keychain** (or a `chmod 600` file on other plat
 
 ## Direct messages
 
-The DM tools require the `instagram_manage_messages` permission, which Meta grants **only through App Review** (typically weeks, and stricter in 2025–2026). Until then, the DM tools fail loud with that instruction rather than silently no-op. Once your app is approved and the token carries the scope, set `INSTAGRAM_MCP_DM_ENABLED=1`. Note Instagram's 24-hour standard-messaging window applies.
+The DM tools require the `instagram_manage_messages` permission, which Meta grants **only through App Review** (typically weeks, and stricter in 2025–2026). Until then, the DM tools fail loud with that instruction rather than silently no-op. Once your app is approved and the token carries the scope, set `INSTAGRAM_MCP_DM_ENABLED=1`. Note Instagram's 24-hour standard-messaging window applies; up to 7 days a human-written reply can be sent with `tag="HUMAN_AGENT"` (needs the `human_agent` permission). DM calls use the linked Facebook Page's token automatically (the user token returns an opaque error for conversations).
 
 Full App Review walkthrough (screencast shot list, reviewer test-instructions template, privacy-policy + business-verification requirements, post-approval flip, message-tag caveat): **[docs/APP_REVIEW.md](docs/APP_REVIEW.md)**.
 

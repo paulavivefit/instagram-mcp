@@ -22,7 +22,7 @@ The quickest path for a single account:
 4. This gives a **short-lived** token (1 hour). Exchange it for a **long-lived** token (~60 days):
 
 ```bash
-curl -s "https://graph.facebook.com/v21.0/oauth/access_token?grant_type=fb_exchange_token&client_id=APP_ID&client_secret=APP_SECRET&fb_exchange_token=SHORT_LIVED_TOKEN"
+curl -s "https://graph.facebook.com/v27.0/oauth/access_token?grant_type=fb_exchange_token&client_id=APP_ID&client_secret=APP_SECRET&fb_exchange_token=SHORT_LIVED_TOKEN"
 ```
 
 For production / multi-account, implement the standard Facebook Login token flow so each account owner authorizes their own token.
@@ -31,10 +31,10 @@ For production / multi-account, implement the standard Facebook Login token flow
 
 ```bash
 # a) list the Pages you manage
-curl -s "https://graph.facebook.com/v21.0/me/accounts?access_token=LONG_LIVED_TOKEN"
+curl -s "https://graph.facebook.com/v27.0/me/accounts?access_token=LONG_LIVED_TOKEN"
 
 # b) for your Page id, read its connected Instagram account
-curl -s "https://graph.facebook.com/v21.0/PAGE_ID?fields=instagram_business_account&access_token=LONG_LIVED_TOKEN"
+curl -s "https://graph.facebook.com/v27.0/PAGE_ID?fields=instagram_business_account&access_token=LONG_LIVED_TOKEN"
 ```
 
 The `instagram_business_account.id` value is your `INSTAGRAM_MCP_IG_USER_ID`.
@@ -69,7 +69,7 @@ See **[docs/APP_REVIEW.md](docs/APP_REVIEW.md)** for the full submission walkthr
 Long-lived tokens last ~60 days. Refresh before expiry:
 
 ```bash
-curl -s "https://graph.facebook.com/v21.0/oauth/access_token?grant_type=fb_exchange_token&client_id=APP_ID&client_secret=APP_SECRET&fb_exchange_token=CURRENT_LONG_LIVED_TOKEN"
+curl -s "https://graph.facebook.com/v27.0/oauth/access_token?grant_type=fb_exchange_token&client_id=APP_ID&client_secret=APP_SECRET&fb_exchange_token=CURRENT_LONG_LIVED_TOKEN"
 ```
 
 Then `add_account` again with the same label to overwrite the stored token.

@@ -60,6 +60,8 @@ def test_list_conversations_fail_soft_when_later_page_hangs(dm_account):
     assert res["ok"] is True, res
     assert res["count"] == 1
     assert "stopped early" in res["note"]
+    # the soft probe for page 2 must not be retried (it would just hang 3x as long)
+    assert len([c for c in dm_account.calls("GET", r"/conversations$") if "after" in c.params]) == 1
 
 
 def test_get_messages_accepts_long_base64_conversation_id(dm_account):

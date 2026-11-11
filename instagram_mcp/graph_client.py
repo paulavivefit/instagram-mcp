@@ -31,7 +31,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-GRAPH_VERSION = os.environ.get("INSTAGRAM_MCP_GRAPH_VERSION", "v21.0")
+GRAPH_VERSION = os.environ.get("INSTAGRAM_MCP_GRAPH_VERSION", "v27.0")
 DEFAULT_TIMEOUT = float(os.environ.get("INSTAGRAM_MCP_TIMEOUT", "60"))
 MAX_ATTEMPTS = max(1, int(os.environ.get("INSTAGRAM_MCP_MAX_ATTEMPTS", "3")))
 BACKOFF_BASE_S = 1.0
@@ -221,6 +221,7 @@ class GraphClient:
         app_secret: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         transport: httpx.BaseTransport | None = None,
+        max_attempts: int | None = None,
     ) -> None:
         if base_host not in ALLOWED_HOSTS:
             raise GraphAPIError(
@@ -234,6 +235,7 @@ class GraphClient:
         self._app_secret = app_secret
         self._timeout = timeout
         self._transport = transport
+        self._max_attempts = max_attempts
 
     def _appsecret_proof(self) -> str | None:
         """HMAC-SHA256(token) keyed by app_secret — Meta's recommended call hardening."""
@@ -273,7 +275,7 @@ class GraphClient:
         attempt = 0
         while True:
             attempt += 1
-            can_retry = attempt < MAX_ATTEMPTS
+            can_retry = attempt < (self._max_attempts or MAX_ATTEMPTS)
             try:
                 with httpx.Client(timeout=self._timeout,
                                   transport=self._transport or DEFAULT_TRANSPORT) as client:
