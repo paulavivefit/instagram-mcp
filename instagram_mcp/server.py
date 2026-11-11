@@ -731,17 +731,25 @@ def publish_container(container_id: str, account: str | None = None) -> dict[str
 
 
 @mcp.tool()
-def publish_image(image_url: str, caption: str | None = None, account: str | None = None) -> dict[str, Any]:
+def publish_image(image_url: str, caption: str | None = None, account: str | None = None, *,
+                  alt_text: str | None = None, user_tags: list[dict[str, Any]] | None = None,
+                  location_id: str | None = None, collaborators: list[str] | None = None) -> dict[str, Any]:
     """Publish a single image to the feed.
 
     image_url must be a PUBLIC https URL (Instagram fetches the bytes itself). caption
-    <= 2200 chars. Two-step Graph flow (create container -> publish) handled internally.
+    <= 2200 chars, <= 30 hashtags, <= 20 @mentions. Optional: alt_text (accessibility,
+    <= 1000 chars), user_tags [{username, x, y}] with x/y 0-1 from the top-left,
+    location_id (Facebook location Page id), collaborators (<= 3 usernames, they get an invite).
     """
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         url = V.validate_public_https_url(image_url, field="image_url")
-        cap = V.validate_caption(caption)
-        container = client.post(f"{acct.ig_user_id}/media", image_url=url, caption=cap)
+        params = {"image_url": url, "caption": V.validate_caption(caption),
+                  "alt_text": V.validate_alt_text(alt_text),
+                  "user_tags": V.validate_user_tags(user_tags),
+                  "location_id": V.validate_location_id(location_id),
+                  "collaborators": V.validate_collaborators(collaborators)}
+        container = client.post(f"{acct.ig_user_id}/media", **params)
         cid = container.get("id")
         return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid)}
     return _guard("publish_image", {"image_url": image_url, "caption": V.truncate(caption or ""),
@@ -768,19 +776,32 @@ def publish_video(video_url: str, caption: str | None = None, account: str | Non
 
 @mcp.tool()
 def publish_reel(video_url: str, caption: str | None = None, account: str | None = None,
-                 *, share_to_feed: bool = True, cover_url: str | None = None) -> dict[str, Any]:
+                 *, share_to_feed: bool = True, cover_url: str | None = None,
+                 thumb_offset: int | None = None, collaborators: list[str] | None = None,
+                 audio_name: str | None = None, location_id: str | None = None,
+                 user_tags: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Publish a Reel. video_url must be a PUBLIC https URL.
 
-    share_to_feed also surfaces the reel in the main grid. cover_url (optional) sets the
-    thumbnail. Reel containers process asynchronously (polled up to 90s).
+    share_to_feed also shows it in the main grid. Cover: cover_url (image) or
+    thumb_offset (milliseconds into the video). Optional collaborators (<= 3), audio_name
+    (renames original audio), location_id, user_tags [{username}]. Processing is polled
+    up to INSTAGRAM_MCP_VIDEO_WAIT_S (default 300 s); on timeout use publish_container.
     """
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         url = V.validate_public_https_url(video_url, field="video_url")
-        cap = V.validate_caption(caption)
         cover = V.validate_public_https_url(cover_url, field="cover_url") if cover_url else None
+        if thumb_offset is not None and (isinstance(thumb_offset, bool) or not isinstance(thumb_offset, int)
+                                         or thumb_offset < 0):
+            raise V.ValidationError("thumb_offset must be a whole number of milliseconds >= 0")
+        if audio_name is not None and (not isinstance(audio_name, str) or len(audio_name) > 100):
+            raise V.ValidationError("audio_name must be text of at most 100 characters")
         container = client.post(f"{acct.ig_user_id}/media", media_type="REELS", video_url=url,
-                                caption=cap, share_to_feed=share_to_feed, cover_url=cover)
+                                caption=V.validate_caption(caption), share_to_feed=share_to_feed,
+                                cover_url=cover, thumb_offset=thumb_offset, audio_name=audio_name,
+                                collaborators=V.validate_collaborators(collaborators),
+                                location_id=V.validate_location_id(location_id),
+                                user_tags=V.validate_user_tags(user_tags, require_xy=False))
         cid = container.get("id")
         _wait_container_ready(client, cid)
         return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid)}
@@ -788,25 +809,47 @@ def publish_reel(video_url: str, caption: str | None = None, account: str | None
                                    "share_to_feed": share_to_feed, "account": account}, _impl)
 
 
+CAROUSEL_MAX = int(os.environ.get("INSTAGRAM_MCP_CAROUSEL_MAX", "10"))
+_VIDEO_EXT = (".mp4", ".mov", ".m4v")
+
+
+def _is_video_url(url: str) -> bool:
+    return url.split("?", 1)[0].lower().endswith(_VIDEO_EXT)
+
+
 @mcp.tool()
 def publish_carousel(image_urls: list[str], caption: str | None = None,
-                     account: str | None = None) -> dict[str, Any]:
-    """Publish a multi-image carousel (2-10 images). Each image_url must be a PUBLIC https URL.
+                     account: str | None = None, *, collaborators: list[str] | None = None,
+                     location_id: str | None = None) -> dict[str, Any]:
+    """Publish a carousel of 2-10 items (images and/or videos). Each URL must be PUBLIC https.
 
-    Creates one child container per image (is_carousel_item) then a CAROUSEL parent, then publishes.
+    Items ending in .mp4/.mov/.m4v are uploaded as videos and waited on before the
+    carousel is created. Optional collaborators (<= 3) and location_id. The item limit
+    can be raised with INSTAGRAM_MCP_CAROUSEL_MAX if Meta allows more for the account.
     """
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
-        if not isinstance(image_urls, list) or not (2 <= len(image_urls) <= 10):
-            raise V.ValidationError("image_urls must be a list of 2-10 public https URLs")
+        if not isinstance(image_urls, list) or not (2 <= len(image_urls) <= CAROUSEL_MAX):
+            raise V.ValidationError(f"image_urls must be a list of 2-{CAROUSEL_MAX} public https URLs")
         urls = [V.validate_public_https_url(u, field="image_url") for u in image_urls]
         cap = V.validate_caption(caption)
+        collab = V.validate_collaborators(collaborators)
+        loc = V.validate_location_id(location_id)
         child_ids: list[str] = []
+        video_ids: list[str] = []
         for u in urls:
-            child = client.post(f"{acct.ig_user_id}/media", image_url=u, is_carousel_item=True)
+            if _is_video_url(u):
+                child = client.post(f"{acct.ig_user_id}/media", media_type="VIDEO", video_url=u,
+                                    is_carousel_item=True)
+                video_ids.append(child.get("id"))
+            else:
+                child = client.post(f"{acct.ig_user_id}/media", image_url=u, is_carousel_item=True)
             child_ids.append(child.get("id"))
+        for vid in video_ids:
+            _wait_container_ready(client, vid)
         parent = client.post(f"{acct.ig_user_id}/media", media_type="CAROUSEL",
-                             children=",".join(child_ids), caption=cap)
+                             children=",".join(child_ids), caption=cap, collaborators=collab,
+                             location_id=loc)
         cid = parent.get("id")
         return {"account": acct.label, "child_count": len(child_ids),
                 **_publish_container(client, acct.ig_user_id, cid)}
