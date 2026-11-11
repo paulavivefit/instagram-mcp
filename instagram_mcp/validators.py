@@ -55,6 +55,23 @@ def validate_graph_id(value: str, *, field: str = "id") -> str:
     return v
 
 
+_CONVERSATION_ID_RE = re.compile(r"^[0-9A-Za-z_\-=]{1,256}$")
+
+
+def validate_conversation_id(value: str | None, *, field: str = "conversation_id") -> str:
+    """An IG conversation id: long base64-style string (letters, digits, - _ =).
+
+    Unlike media ids these exceed 64 chars; path/query characters (/ ? & space) are
+    rejected so the id can never alter the request path.
+    """
+    if value is None or not isinstance(value, str):
+        raise ValidationError(f"{field} must be a string")
+    v = value.strip()
+    if not _CONVERSATION_ID_RE.match(v):
+        raise ValidationError(f"{field} must be the id returned by list_conversations")
+    return v
+
+
 def validate_caption(value: str | None, *, field: str = "caption") -> str | None:
     """Instagram caption: <= 2200 chars. None passes through (caption is optional)."""
     if value is None:
