@@ -97,6 +97,8 @@ def _guard(tool: str, input_payload: dict[str, Any], impl: Any) -> dict[str, Any
         audit.record(tool, execution_time_ms=_ms(start),
                      io={"input": safe_in, "output": {"error": message}},
                      error_class=error_class)
+        if error_class == "oauth":
+            _PAGE_CACHE.clear()  # a revoked/expired token must not stay cached
         out = {"ok": False, "error": message, "error_class": error_class}
         extra = getattr(exc, "extra", None)
         if isinstance(extra, dict):
@@ -164,8 +166,20 @@ def _wait_container_ready(client: graph_client.GraphClient, container_id: str,
         time.sleep(interval_s)
 
 
+PUBLISH_UNCERTAIN_HINT = ("The publish request failed or timed out, so the post MAY already be live. "
+                          "Check list_media (newest first) before doing anything else. If it is not "
+                          "there, call publish_container(container_id); do not call publish_* again "
+                          "(that would upload a second copy).")
+
+
 def _publish_container(client: graph_client.GraphClient, ig_user_id: str, container_id: str) -> dict[str, Any]:
-    published = client.post(f"{ig_user_id}/media_publish", creation_id=container_id)
+    try:
+        published = client.post(f"{ig_user_id}/media_publish", creation_id=container_id)
+    except graph_client.GraphAPIError as exc:
+        raise graph_client.GraphAPIError(str(exc), error_class=exc.error_class, code=exc.code,
+                                         subcode=exc.subcode, http_status=exc.http_status,
+                                         extra={"container_id": container_id,
+                                                "hint": PUBLISH_UNCERTAIN_HINT}) from exc
     return {"ok": True, "media_id": published.get("id"), "container_id": container_id}
 
 
@@ -306,10 +320,13 @@ def list_media(account: str | None = None, *, limit: int | str = 25, after: str 
             ts = item.get("timestamp")
             return bool(start_dt and ts and V.parse_graph_time(ts) < start_dt)
 
+        def too_new(item: dict[str, Any]) -> bool:
+            ts = item.get("timestamp")
+            return bool(end_dt and ts and V.parse_graph_time(ts) > end_dt)
+
         items, cursor = client.paginate(f"{acct.ig_user_id}/media", fields=MEDIA_FIELDS,
-                                        max_items=lim, after=cur, stop=too_old if start_dt else None)
-        if end_dt:
-            items = [m for m in items if not m.get("timestamp") or V.parse_graph_time(m["timestamp"]) <= end_dt]
+                                        max_items=lim, after=cur, stop=too_old if start_dt else None,
+                                        skip=too_new if end_dt else None)
         return _paged({"ok": True, "account": acct.label}, items, cursor, "media")
     return _guard("list_media", {"account": account, "limit": limit, "since": since, "until": until}, _impl)
 
@@ -734,7 +751,7 @@ def publish_container(container_id: str, account: str | None = None) -> dict[str
 @mcp.tool()
 def publish_image(image_url: str, caption: str | None = None, account: str | None = None, *,
                   alt_text: str | None = None, user_tags: list[dict[str, Any]] | None = None,
-                  location_id: str | None = None, collaborators: list[str] | None = None) -> dict[str, Any]:
+                  location_id: str | int | None = None, collaborators: list[str] | None = None) -> dict[str, Any]:
     """Publish a single image to the feed.
 
     image_url must be a PUBLIC https URL (Instagram fetches the bytes itself). caption
@@ -779,7 +796,7 @@ def publish_video(video_url: str, caption: str | None = None, account: str | Non
 def publish_reel(video_url: str, caption: str | None = None, account: str | None = None,
                  *, share_to_feed: bool = True, cover_url: str | None = None,
                  thumb_offset: int | None = None, collaborators: list[str] | None = None,
-                 audio_name: str | None = None, location_id: str | None = None,
+                 audio_name: str | None = None, location_id: str | int | None = None,
                  user_tags: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Publish a Reel. video_url must be a PUBLIC https URL.
 
@@ -821,7 +838,7 @@ def _is_video_url(url: str) -> bool:
 @mcp.tool()
 def publish_carousel(image_urls: list[str], caption: str | None = None,
                      account: str | None = None, *, collaborators: list[str] | None = None,
-                     location_id: str | None = None) -> dict[str, Any]:
+                     location_id: str | int | None = None) -> dict[str, Any]:
     """Publish a carousel of 2-10 items (images and/or videos). Each URL must be PUBLIC https.
 
     Items ending in .mp4/.mov/.m4v are uploaded as videos and waited on before the
@@ -847,7 +864,15 @@ def publish_carousel(image_urls: list[str], caption: str | None = None,
                 child = client.post(f"{acct.ig_user_id}/media", image_url=u, is_carousel_item=True)
             child_ids.append(child.get("id"))
         for vid in video_ids:
-            _wait_container_ready(client, vid)
+            try:
+                _wait_container_ready(client, vid)
+            except graph_client.GraphAPIError as exc:
+                raise graph_client.GraphAPIError(
+                    str(exc), error_class=exc.error_class,
+                    extra={"child_container_ids": child_ids,
+                           "hint": "A carousel video is still processing (or failed); nothing was "
+                                   "published. Run publish_carousel again later (carousel items "
+                                   "cannot be published on their own)."}) from exc
         parent = client.post(f"{acct.ig_user_id}/media", media_type="CAROUSEL",
                              children=",".join(child_ids), caption=cap, collaborators=collab,
                              location_id=loc)
@@ -1060,16 +1085,19 @@ def business_discovery(username: str, account: str | None = None, *, with_media:
 # with the app-review hint unless INSTAGRAM_MCP_DM_ENABLED=1 AND the token carries
 # the scope. Scaffolded (not stubbed) so enabling is a one-flag flip post-approval.
 
-_PAGE_CACHE: dict = {}
+_PAGE_CACHE: dict[tuple[str, str, str], Any] = {}
 
 
 def _page_dm_client(client, acct):
     """IG messaging (Facebook-Login path) works reliably only with the PAGE token,
     on the Page node. Resolve the Page linked to this IG account and return
     (page_client, page_id). Slow Meta responses -> generous timeout."""
+    import hashlib
+
     from instagram_mcp import graph_client as _gc
-    if acct.label in _PAGE_CACHE:
-        return _PAGE_CACHE[acct.label]
+    key = (acct.label, acct.ig_user_id, hashlib.sha256(acct.access_token.encode()).hexdigest())
+    if key in _PAGE_CACHE:
+        return _PAGE_CACHE[key]
     slow = _gc.GraphClient(acct.access_token, base_host=acct.base_host,
                            app_secret=acct.app_secret, timeout=120.0)
     res = slow.get("me/accounts", fields="id,access_token,instagram_business_account", limit=100)
@@ -1077,7 +1105,7 @@ def _page_dm_client(client, acct):
         if (pg.get("instagram_business_account") or {}).get("id") == acct.ig_user_id:
             out = (_gc.GraphClient(pg["access_token"], base_host=acct.base_host,
                                    app_secret=acct.app_secret, timeout=120.0), pg["id"])
-            _PAGE_CACHE[acct.label] = out
+            _PAGE_CACHE[key] = out
             return out
     raise V.ValidationError("no Facebook Page linked to this Instagram account was found in me/accounts")
 
@@ -1132,8 +1160,8 @@ def list_conversations(account: str | None = None, *, limit: int | str = 5,
 
 
 @mcp.tool()
-def get_messages(conversation_id: str, account: str | None = None, *, limit: int = 10) -> dict[str, Any]:
-    """Read messages in a DM conversation, newest first. limit 1-25 (default 10).
+def get_messages(conversation_id: str, account: str | None = None, *, limit: int | str = 10) -> dict[str, Any]:
+    """Read messages in a DM conversation, newest first. limit 1-100 or "all" (default 10).
     REQUIRES Meta App Review (instagram_manage_messages)."""
     def _impl() -> dict[str, Any]:
         _require_dm()
@@ -1196,13 +1224,19 @@ def send_message(recipient_id: str, text: str | None = None, account: str | None
             try:
                 results.append(pclient.post(f"{page_id}/messages", recipient=json.dumps({"id": rid}),
                                             message=json.dumps(body, ensure_ascii=False), **routing))
-            except graph_client.GraphAPIError as exc:
-                if _is_outside_window(exc):
+            except Exception as exc:  # noqa: BLE001 - re-raised with what was already sent
+                sent = {"sent_before_error": len(results),
+                        "message_ids": [r.get("message_id") for r in results]}
+                if isinstance(exc, graph_client.GraphAPIError) and _is_outside_window(exc):
                     raise graph_client.GraphAPIError(str(exc), error_class="outside_window",
                                                      code=exc.code, subcode=exc.subcode,
-                                                     extra={"hint": OUTSIDE_WINDOW_HINT,
-                                                            "sent_before_error": len(results)}) from exc
-                raise
+                                                     extra={"hint": OUTSIDE_WINDOW_HINT, **sent}) from exc
+                if not results:
+                    raise
+                raise graph_client.GraphAPIError(
+                    audit.sanitize_error(str(exc)), error_class=audit.classify_error(exc),
+                    extra={**sent, "hint": f"{len(results)} message(s) were already delivered; do not "
+                                           "resend those, only retry the part that failed."}) from exc
         return {"ok": True, "account": acct.label, "recipient_id": rid, "tag": tag,
                 "message_ids": [r.get("message_id") for r in results], "result": results[-1]}
     return _guard("send_message", {"recipient_id": recipient_id, "text": V.truncate(text or ""),

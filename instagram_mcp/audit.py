@@ -38,6 +38,7 @@ AUDIT_PATH = Path(os.environ.get("INSTAGRAM_MCP_AUDIT_PATH") or
 _SCRUB_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"EAA[A-Za-z0-9]{20,}"), "EAA***META_TOKEN_REDACTED***"),
     (re.compile(r"IGQV[A-Za-z0-9_\-]{20,}"), "IGQV***IG_TOKEN_REDACTED***"),
+    (re.compile(r"IGAA[A-Za-z0-9_\-]{20,}"), "IGAA***IG_TOKEN_REDACTED***"),
     (re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"), "sk-ant-***REDACTED***"),
     (re.compile(r"sk-proj-[A-Za-z0-9_\-]{20,}"), "sk-proj-***REDACTED***"),
     (re.compile(r"ghp_[A-Za-z0-9_]{20,}"), "ghp_***REDACTED***"),
