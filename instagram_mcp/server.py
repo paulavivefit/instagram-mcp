@@ -93,7 +93,11 @@ def _guard(tool: str, input_payload: dict[str, Any], impl: Any) -> dict[str, Any
         audit.record(tool, execution_time_ms=_ms(start),
                      io={"input": safe_in, "output": {"error": message}},
                      error_class=error_class)
-        return {"ok": False, "error": message, "error_class": error_class}
+        out = {"ok": False, "error": message, "error_class": error_class}
+        extra = getattr(exc, "extra", None)
+        if isinstance(extra, dict):
+            out.update({k: v for k, v in extra.items() if k not in out})
+        return out
 
 
 def _account_summary(acct: auth.ResolvedAccount) -> dict[str, Any]:
@@ -126,11 +130,21 @@ def _require_dm() -> None:
         )
 
 
+VIDEO_WAIT_S = int(os.environ.get("INSTAGRAM_MCP_VIDEO_WAIT_S", "300"))
+PUBLISH_LATER_HINT = ("Instagram is still processing the video. Nothing was published yet. "
+                      "Call publish_container(container_id) in a few minutes to finish without re-uploading.")
+
+
 def _wait_container_ready(client: graph_client.GraphClient, container_id: str,
-                          *, timeout_s: int = 90, interval_s: int = 4) -> None:
-    """Poll a media container until status_code=FINISHED (video/reel/story-video are async)."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
+                          *, timeout_s: int | None = None, interval_s: int = 5) -> None:
+    """Poll a media container until status_code=FINISHED (video/reel/story-video are async).
+
+    On timeout raises a GraphAPIError(error_class=timeout) carrying container_id + a hint,
+    so the caller can finish later with publish_container instead of re-uploading.
+    """
+    wait = VIDEO_WAIT_S if timeout_s is None else timeout_s
+    deadline = time.monotonic() + wait
+    while True:
         status = client.get(container_id, fields="status_code,status")
         code = status.get("status_code")
         if code == "FINISHED":
@@ -139,9 +153,11 @@ def _wait_container_ready(client: graph_client.GraphClient, container_id: str,
             raise graph_client.GraphAPIError(
                 f"media container {container_id} processing failed: {status.get('status')}",
                 error_class="upstream_error")
+        if time.monotonic() + interval_s > deadline:
+            raise graph_client.GraphAPIError(
+                f"media container {container_id} not ready after {wait}s", error_class="timeout",
+                extra={"container_id": container_id, "status_code": code, "hint": PUBLISH_LATER_HINT})
         time.sleep(interval_s)
-    raise graph_client.GraphAPIError(
-        f"media container {container_id} not ready after {timeout_s}s", error_class="timeout")
 
 
 def _publish_container(client: graph_client.GraphClient, ig_user_id: str, container_id: str) -> dict[str, Any]:
@@ -178,6 +194,12 @@ def healthcheck() -> dict[str, Any]:
             client, acct = auth.client_for(None)
             me = client.get(acct.ig_user_id, fields="id,username")
             out["live_check"] = {"ok": True, "username": me.get("username"), "account": acct.label}
+            if graph_client.LAST_USAGE:
+                usage = dict(graph_client.LAST_USAGE)
+                if usage.get("max_percent", 0) >= 80:
+                    usage["warning"] = ("Meta rate limit nearly reached; heavy calls (limit=\"all\") "
+                                        "may be throttled for up to an hour.")
+                out["api_usage"] = usage
         except Exception as exc:  # noqa: BLE001
             out["ok"] = False
             out["live_check"] = {"ok": False, "error": audit.sanitize_error(str(exc)),
@@ -425,6 +447,28 @@ def publishing_limit(account: str | None = None) -> dict[str, Any]:
                            fields="config,quota_usage")
         return {"ok": True, "account": acct.label, "limit": data.get("data", [])}
     return _guard("publishing_limit", {"account": account}, _impl)
+
+
+@mcp.tool()
+def publish_container(container_id: str, account: str | None = None) -> dict[str, Any]:
+    """Finish publishing a media container created earlier (e.g. a video that was still
+    processing when publish_video/publish_reel/publish_story timed out).
+
+    Publishes if processing is FINISHED; otherwise returns ok=false with its status_code.
+    """
+    def _impl() -> dict[str, Any]:
+        client, acct = auth.client_for(account)
+        cid = V.validate_graph_id(container_id, field="container_id")
+        status = client.get(cid, fields="status_code,status")
+        code = status.get("status_code")
+        if code == "FINISHED":
+            return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid)}
+        if code == "ERROR":
+            raise graph_client.GraphAPIError(f"media container {cid} processing failed: {status.get('status')}",
+                                             error_class="upstream_error")
+        return {"ok": False, "account": acct.label, "container_id": cid, "status_code": code,
+                "error_class": "not_ready", "hint": "Still processing; try again in a minute."}
+    return _guard("publish_container", {"container_id": container_id, "account": account}, _impl)
 
 
 @mcp.tool()
