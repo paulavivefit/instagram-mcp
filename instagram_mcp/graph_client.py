@@ -236,6 +236,7 @@ class GraphClient:
         self._timeout = timeout
         self._transport = transport
         self._max_attempts = max_attempts
+        self.last_cut = False
 
     def _appsecret_proof(self) -> str | None:
         """HMAC-SHA256(token) keyed by app_secret — Meta's recommended call hardening."""
@@ -343,8 +344,11 @@ class GraphClient:
         """
         out: list[dict[str, Any]] = []
         cursor = after
+        self.last_cut = False
         while True:
-            size = max(1, min(page_size, max_items - len(out)))
+            # While skipping, ask for full pages: skipped items don't count, and small
+            # pages would burn through the hourly API budget.
+            size = page_size if skip is not None else max(1, min(page_size, max_items - len(out)))
             page = self.get(path, limit=size, after=cursor, **params)
             data = page.get("data") or []
             for item in data:
@@ -355,6 +359,10 @@ class GraphClient:
                 out.append(item)
             paging = page.get("paging") or {}
             nxt = (paging.get("cursors") or {}).get("after")
+            if skip is not None and len(out) > max_items:
+                # cut inside a page: a Graph cursor cannot resume mid-page
+                self.last_cut = True
+                return out[:max_items], None
             if not data or not nxt or not paging.get("next"):
                 return out, None
             if len(out) >= max_items:
