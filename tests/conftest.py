@@ -43,6 +43,9 @@ def _isolate_env(tmp_path, monkeypatch):
     monkeypatch.delenv("INSTAGRAM_MCP_ACCESS_TOKEN", raising=False)
     monkeypatch.delenv("INSTAGRAM_MCP_IG_USER_ID", raising=False)
     monkeypatch.delenv("INSTAGRAM_MCP_DM_ENABLED", raising=False)
+    # never really sleep in tests (retry backoff, video polling)
+    import time
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
     for mod in list(sys.modules):
         if mod in _MODULES:
             del sys.modules[mod]

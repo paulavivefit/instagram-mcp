@@ -23,14 +23,28 @@ import hashlib
 import hmac
 import ipaddress
 import os
+import random
 import socket
+import time
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 
 GRAPH_VERSION = os.environ.get("INSTAGRAM_MCP_GRAPH_VERSION", "v21.0")
-DEFAULT_TIMEOUT = float(os.environ.get("INSTAGRAM_MCP_TIMEOUT", "30"))
+DEFAULT_TIMEOUT = float(os.environ.get("INSTAGRAM_MCP_TIMEOUT", "60"))
+MAX_ATTEMPTS = max(1, int(os.environ.get("INSTAGRAM_MCP_MAX_ATTEMPTS", "3")))
+BACKOFF_BASE_S = 1.0
+MAX_RETRY_AFTER_S = 60.0
+
+# Meta "too many calls" codes: the request was rejected unprocessed, so even a POST
+# can be retried safely. (4 app, 17 user, 32 page, 613 custom, 80002 Instagram BUC.)
+THROTTLE_CODES = frozenset({4, 17, 32, 613, 80002})
+
+_sleep = time.sleep  # patched in tests
+
+# Latest rate-limit usage reported by Meta response headers (percent of quota).
+LAST_USAGE: dict[str, Any] = {}
 
 # Test seam: when set (tests only), every GraphClient sends through this transport
 # instead of the network. Production leaves it None.
@@ -57,8 +71,12 @@ class GraphAPIError(RuntimeError):
         subcode: int | None = None,
         type_: str | None = None,
         http_status: int | None = None,
+        transient: bool = False,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
+        self.transient = transient
+        self.extra = extra or {}
         self.error_class = error_class
         self.code = code
         self.subcode = subcode
@@ -119,7 +137,7 @@ def _map_graph_error(payload: dict[str, Any], http_status: int) -> GraphAPIError
     error_class = "upstream_error"
     if code == 190 or etype == "OAuthException":
         error_class = "oauth"
-    if code in {4, 17, 32, 613} or (isinstance(message, str) and "rate limit" in message.lower()):
+    if code in THROTTLE_CODES or (isinstance(message, str) and "rate limit" in message.lower()):
         error_class = "rate_limited"
     if code in {10, 200, 803} or (isinstance(code, int) and 200 <= code <= 299):
         error_class = "permission"
@@ -136,7 +154,56 @@ def _map_graph_error(payload: dict[str, Any], http_status: int) -> GraphAPIError
         subcode=subcode if isinstance(subcode, int) else None,
         type_=etype if isinstance(etype, str) else None,
         http_status=http_status,
+        transient=bool(err.get("is_transient")),
     )
+
+
+def _backoff(attempt: int) -> float:
+    """Exponential backoff with a little jitter: ~1s, ~2s, ~4s ..."""
+    return BACKOFF_BASE_S * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+
+
+def _retry_after(headers: Any) -> float | None:
+    raw = headers.get("Retry-After") if headers is not None else None
+    try:
+        return min(float(raw), MAX_RETRY_AFTER_S) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _pct_max(values: Any) -> float:
+    nums = [v for v in (values or []) if isinstance(v, (int, float))]
+    return float(max(nums)) if nums else 0.0
+
+
+def _record_usage(headers: Any) -> None:
+    """Remember Meta's rate-limit usage headers (percent of the hourly quota)."""
+    import json
+    if headers is None:
+        return
+    app_raw = headers.get("X-App-Usage")
+    buc_raw = headers.get("X-Business-Use-Case-Usage")
+    if not app_raw and not buc_raw:
+        return
+    usage: dict[str, Any] = {}
+    peak = 0.0
+    try:
+        if app_raw:
+            app = json.loads(app_raw)
+            usage["app"] = app
+            peak = max(peak, _pct_max([app.get("call_count"), app.get("total_time"), app.get("total_cputime")]))
+        if buc_raw:
+            buc = json.loads(buc_raw)
+            usage["business"] = buc
+            for entries in buc.values():
+                for e in entries or []:
+                    peak = max(peak, _pct_max([e.get("call_count"), e.get("total_time"), e.get("total_cputime")]))
+    except (ValueError, AttributeError, TypeError):
+        return
+    usage["max_percent"] = int(peak)
+    usage["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    LAST_USAGE.clear()
+    LAST_USAGE.update(usage)
 
 
 class GraphClient:
@@ -203,22 +270,42 @@ class GraphClient:
             raise GraphAPIError(f"refusing egress to non-Meta host in {url!r}", error_class="ssrf_blocked")
         query = dict(params or {})
         query.update(self._auth_params())
-        try:
-            with httpx.Client(timeout=self._timeout,
-                              transport=self._transport or DEFAULT_TRANSPORT) as client:
-                resp = client.request(method, url, params=query, data=data)
-        except httpx.TimeoutException as exc:
-            raise GraphAPIError(f"Graph API request timed out after {self._timeout}s", error_class="timeout") from exc
-        except httpx.HTTPError as exc:
-            raise GraphAPIError(f"Graph API transport error: {exc}", error_class="network") from exc
+        attempt = 0
+        while True:
+            attempt += 1
+            can_retry = attempt < MAX_ATTEMPTS
+            try:
+                with httpx.Client(timeout=self._timeout,
+                                  transport=self._transport or DEFAULT_TRANSPORT) as client:
+                    resp = client.request(method, url, params=query, data=data)
+            except httpx.TimeoutException as exc:
+                # A timed-out POST may have been processed (published/sent): never repeat it.
+                if method == "GET" and can_retry:
+                    _sleep(_backoff(attempt))
+                    continue
+                raise GraphAPIError(f"Graph API request timed out after {self._timeout}s",
+                                    error_class="timeout") from exc
+            except httpx.HTTPError as exc:
+                # A connect error means nothing was sent, so any method is safe to retry.
+                if can_retry and (method == "GET" or isinstance(exc, httpx.ConnectError)):
+                    _sleep(_backoff(attempt))
+                    continue
+                raise GraphAPIError(f"Graph API transport error: {exc}", error_class="network") from exc
 
-        try:
-            body = resp.json()
-        except ValueError:
-            body = {}
-        if resp.status_code >= 400 or (isinstance(body, dict) and "error" in body):
-            raise _map_graph_error(body if isinstance(body, dict) else {}, resp.status_code)
-        return body if isinstance(body, dict) else {"data": body}
+            _record_usage(getattr(resp, "headers", None))
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+            if resp.status_code >= 400 or (isinstance(body, dict) and "error" in body):
+                err = _map_graph_error(body if isinstance(body, dict) else {}, resp.status_code)
+                throttled = err.code in THROTTLE_CODES or resp.status_code == 429
+                server_side = resp.status_code >= 500 or err.transient
+                if can_retry and (throttled or (method == "GET" and server_side)):
+                    _sleep(_retry_after(getattr(resp, "headers", None)) or _backoff(attempt))
+                    continue
+                raise err
+            return body if isinstance(body, dict) else {"data": body}
 
     def get(self, path: str, **params: Any) -> dict[str, Any]:
         clean = {k: v for k, v in params.items() if v is not None}
