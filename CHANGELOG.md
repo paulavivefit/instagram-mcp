@@ -3,6 +3,27 @@
 All notable changes to instagram-mcp are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [0.2.0] — 2026-11-11
+
+Fork release (paulavivefit/instagram-mcp). 35 tools, 117+ tests with an in-memory fake Graph API.
+
+### Fixed
+- `get_account_insights` default failed: retired `impressions` removed; totals (`views`, `profile_views`, `accounts_engaged`, `total_interactions`) requested with `metric_type=total_value` (period=day only).
+- `get_audience_insights` default failed: one request per breakdown (Meta allows one).
+- DM tools: Page access token on the Page node; one conversation per request; long base64 conversation ids accepted; `get_messages` respects `limit`.
+
+### Added
+- `limit="all"` with per-tool ceilings, `next_cursor`/`after` paging, `list_media` `since`/`until`.
+- Insights over any date range (30-day windows merged), `top_posts`, `insights_summary`, per-type media metrics.
+- `get_comments(include_replies=True)`, `get_comment_replies`, carousel children in `get_media`, `list_stories`.
+- Publishing: alt text, user tags, location, collaborators, reel thumb offset/audio name, mixed image+video carousels, caption hashtag/mention limits, `publish_container` to resume a slow video.
+- DMs: `HUMAN_AGENT` tag, image attachments, `mark_seen`/typing, attachments/shares/story replies in `get_messages`, `outside_window` error with hint.
+- Retries with exponential backoff (never repeats a timed-out POST), Retry-After, rate-limit usage in `healthcheck`, 60 s timeout, 300 s video wait.
+- `scripts/smoke_readonly.py`: live read-only check of every read tool.
+
+### Changed
+- Default Graph API version v21.0 → v27.0 (all read tools verified on both).
+
 ## [0.1.2] — 2026-06-17
 
 ### Added

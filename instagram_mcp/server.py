@@ -1,23 +1,24 @@
-"""instagram-mcp v0.1.2 — official Instagram Graph API MCP.
+"""instagram-mcp v0.2.0 — official Instagram Graph API MCP.
 
 A self-contained, multi-account wrapper over the OFFICIAL Instagram Graph API
 (graph.facebook.com). Read, publish, comment, and pull analytics for any
 Instagram Professional (Business/Creator) account. ToS-safe — no private API.
 
-Tool surface (29):
+Tool surface (35):
 
   HEALTH + ACCOUNTS (6)  healthcheck, list_accounts, add_account,
                          set_default_account, remove_account, account_info
-  PROFILE + MEDIA (3)    get_profile, list_media, get_media
-  INSIGHTS (3)           get_account_insights, get_media_insights,
-                         get_audience_insights
-  PUBLISHING (6)         publish_image, publish_video, publish_reel,
-                         publish_carousel, publish_story, publishing_limit
-  COMMENTS (4)           get_comments, reply_to_comment, hide_comment,
-                         delete_comment
+  PROFILE + MEDIA (4)    get_profile, list_media, get_media, list_stories
+  INSIGHTS (5)           get_account_insights, get_media_insights,
+                         get_audience_insights, top_posts, insights_summary
+  PUBLISHING (7)         publish_image, publish_video, publish_reel,
+                         publish_carousel, publish_story, publish_container,
+                         publishing_limit
+  COMMENTS (5)           get_comments, get_comment_replies, reply_to_comment,
+                         hide_comment, delete_comment
   DISCOVERY (4)          search_hashtag, get_hashtag_media, get_mentions,
                          business_discovery
-  DIRECT MESSAGES (3)    list_conversations, get_messages, send_message
+  DIRECT MESSAGES (4)    list_conversations, get_messages, send_message, mark_seen
                          (gated behind Meta App Review — see _require_dm)
 
 Safety model:
@@ -1109,7 +1110,7 @@ def list_conversations(account: str | None = None, *, limit: int | str = 5,
                 break
             try:  # later pages can hang in dev mode (hidden non-role conversations)
                 short = _gc.GraphClient(pclient._token, base_host=acct.base_host,
-                                        app_secret=acct.app_secret, timeout=20.0)
+                                        app_secret=acct.app_secret, timeout=20.0, max_attempts=1)
                 page = short.get(f"{page_id}/conversations", platform="instagram",
                                  fields="id,updated_time", limit=1, after=nxt)
             except Exception:

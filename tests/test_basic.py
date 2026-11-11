@@ -297,3 +297,14 @@ def test_validate_conversation_id():
     for bad in ["", "a/b", "a?b", "a&b", "a b", "x" * 257, None]:
         with pytest.raises(V.ValidationError):
             V.validate_conversation_id(bad)
+
+
+def test_default_graph_version_is_v27(monkeypatch):
+    monkeypatch.delenv("INSTAGRAM_MCP_GRAPH_VERSION", raising=False)
+    from instagram_mcp import graph_client
+    assert graph_client.GRAPH_VERSION == "v27.0"
+
+
+def test_version_is_0_2_0():
+    import instagram_mcp
+    assert instagram_mcp.__version__ == "0.2.0"

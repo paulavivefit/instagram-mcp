@@ -32,8 +32,7 @@ Standard messaging only lets you reply within **24 hours** of the user's last me
 human on your team needs to reply later (weekends, escalation), request the **`human_agent`**
 permission **in the same submission** — it extends the window to **7 days** for a
 human-sent reply. It's a separate review item, so bundling it now avoids a second multi-week
-review cycle. (`send_message` does not attach a tag yet; out-of-window sends need the
-`HUMAN_AGENT` tag passed through.)
+review cycle. Send those replies with `send_message(..., tag="HUMAN_AGENT")`.
 
 ## Before you submit
 
@@ -85,6 +84,14 @@ Common rejection reasons: screencast doesn't actually show the permission used; 
 unclear; missing/weak privacy policy; app setup incomplete. Most rejections are fixed by
 re-recording the specific shot, not rebuilding the submission.
 
+## Development mode and the Page token
+
+In development mode Meta only returns conversations with people who have a role on the app
+(admin/developer/tester), and pages of more than one conversation can fail with "Please reduce
+the amount of data". The DM tools therefore request one conversation per call and use the
+linked Facebook Page's access token (resolved via `me/accounts`), which Meta requires for
+reading conversation contents.
+
 ## After approval — flip the flag
 
 1. **Refresh the token to carry the new scope.** Re-run your login flow granting
@@ -104,5 +111,5 @@ re-recording the specific shot, not rebuilding the submission.
 You can reply freely for **24 hours** after a user's last message (standard messaging).
 Outside that window you need the **`HUMAN_AGENT`** tag (extends to a 7-day human-reply
 window — request the `human_agent` permission, ideally in the same submission; see above) or
-a paid message tag. `send_message` does **not** attach a tag, so out-of-window sends are
-rejected by Meta until the server is extended to pass one. Reply inside 24h until then.
+a paid message tag. Pass `tag="HUMAN_AGENT"` to `send_message` for a human reply within 7
+days; outside the window the tool returns `error_class: outside_window` with a hint.
