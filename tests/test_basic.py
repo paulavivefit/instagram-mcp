@@ -236,7 +236,7 @@ EXPECTED_TOOLS = {
     "get_profile", "list_media", "get_media",
     "get_account_insights", "get_media_insights", "get_audience_insights",
     "publish_image", "publish_video", "publish_reel", "publish_carousel",
-    "publish_story", "publishing_limit", "publish_container", "top_posts", "insights_summary",
+    "publish_story", "publishing_limit", "publish_container", "top_posts", "insights_summary", "get_comment_replies", "list_stories",
     "get_comments", "reply_to_comment", "hide_comment", "delete_comment",
     "search_hashtag", "get_hashtag_media", "get_mentions", "business_discovery",
     "list_conversations", "get_messages", "send_message",
@@ -245,7 +245,7 @@ EXPECTED_TOOLS = {
 
 def test_server_tool_registry_complete():
     from instagram_mcp import server
-    assert len(EXPECTED_TOOLS) == 32  # 29 non-DM + 3 DM
+    assert len(EXPECTED_TOOLS) == 34  # 31 non-DM + 3 DM
     missing = [name for name in EXPECTED_TOOLS if not hasattr(server, name)]
     assert not missing, f"server module missing tool functions: {missing}"
     for name in EXPECTED_TOOLS:
