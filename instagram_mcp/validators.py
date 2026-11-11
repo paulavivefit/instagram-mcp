@@ -143,15 +143,64 @@ def validate_public_https_url(value: str, *, field: str = "media_url") -> str:
     return v
 
 
-def validate_limit(value: int | None, *, field: str = "limit", default: int = 25, ceiling: int = 100) -> int:
-    """Pagination page size: 1..ceiling, default when None."""
+def validate_limit(value: int | str | None, *, field: str = "limit", default: int = 25,
+                   ceiling: int = 100, all_ceiling: int | None = None) -> int:
+    """Item count: 1..ceiling, or "all" (-> all_ceiling, else ceiling). Default when None.
+
+    Numeric strings ("40") are accepted because MCP clients sometimes send numbers as text.
+    """
     if value is None:
         return default
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise ValidationError(f"{field} must be an integer")
+    if isinstance(value, bool):
+        raise ValidationError(f"{field} must be an integer or \"all\"")
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v == "all":
+            return all_ceiling or ceiling
+        if not v.isdigit():
+            raise ValidationError(f"{field} must be an integer or \"all\"")
+        value = int(v)
+    if not isinstance(value, int):
+        raise ValidationError(f"{field} must be an integer or \"all\"")
     if value < 1 or value > ceiling:
-        raise ValidationError(f"{field} must be between 1 and {ceiling}")
+        raise ValidationError(f"{field} must be between 1 and {ceiling} (or \"all\")")
     return value
+
+
+_CURSOR_RE = re.compile(r"^[0-9A-Za-z_\-=]{1,512}$")
+
+
+def validate_cursor(value: str | None, *, field: str = "after") -> str | None:
+    """A Graph paging cursor (opaque base64-ish). None passes through."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or not _CURSOR_RE.match(value.strip()):
+        raise ValidationError(f"{field} must be the next_cursor value returned by a previous call")
+    return value.strip()
+
+
+def validate_date(value: str | None, *, field: str = "date", end_of_day: bool = False):
+    """YYYY-MM-DD or ISO-8601 -> aware UTC datetime. Date-only + end_of_day -> 23:59:59."""
+    from datetime import datetime, time, timezone
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValidationError(f"{field} must be a date string like 2026-11-01")
+    v = value.strip()
+    try:
+        if len(v) == 10:
+            d = datetime.strptime(v, "%Y-%m-%d").date()
+            return datetime.combine(d, time.max if end_of_day else time.min, tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValidationError(f"{field} must be a date like 2026-11-01 (got {truncate(v, 30)!r})") from exc
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def parse_graph_time(value: str):
+    """Graph timestamps look like 2026-11-11T18:21:43+0000."""
+    from datetime import datetime
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
 
 
 def validate_enum(value: str | None, allowed: set[str], *, field: str, default: str | None = None) -> str | None:
