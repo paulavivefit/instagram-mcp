@@ -100,6 +100,20 @@ def _account_summary(acct: auth.ResolvedAccount) -> dict[str, Any]:
     return {"label": acct.label, "ig_user_id": acct.ig_user_id, "base_host": acct.base_host}
 
 
+# Per-tool ceilings for limit="all" (keeps one call inside Meta's ~200 calls/hour budget).
+CEIL_MEDIA, CEIL_COMMENTS, CEIL_DISCOVERY, CEIL_TAGS, CEIL_CONVERSATIONS, CEIL_MESSAGES = (
+    10000, 5000, 500, 1000, 200, 100)
+
+
+def _paged(out: dict[str, Any], items: list[dict[str, Any]], cursor: str | None, key: str) -> dict[str, Any]:
+    """Attach items + count, and next_cursor/truncated when more results exist."""
+    out.update({"count": len(items), key: items})
+    if cursor:
+        out["next_cursor"] = cursor
+        out["truncated"] = True
+    return out
+
+
 def _require_dm() -> None:
     """DM tools need instagram_manage_messages (Meta App Review). Fail loud, never stub."""
     enabled = os.environ.get("INSTAGRAM_MCP_DM_ENABLED", "").strip().lower() in {"1", "true", "yes"}
@@ -245,15 +259,33 @@ def get_profile(account: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
-def list_media(account: str | None = None, *, limit: int = 25) -> dict[str, Any]:
-    """List recent media (posts/reels) for the account, newest first. limit 1-100 (default 25)."""
+def list_media(account: str | None = None, *, limit: int | str = 25, after: str | None = None,
+               since: str | None = None, until: str | None = None) -> dict[str, Any]:
+    """List the account's posts/reels, newest first.
+
+    limit: 1-10000 or "all" (default 25). since/until: dates like 2026-10-01 (inclusive)
+    to keep only posts in that range. When more posts exist the result has
+    next_cursor; pass it back as `after` to continue.
+    """
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
-        lim = V.validate_limit(limit)
-        items = client.get_paginated(f"{acct.ig_user_id}/media", fields=MEDIA_FIELDS,
-                                      limit=lim, max_items=lim)
-        return {"ok": True, "account": acct.label, "count": len(items), "media": items}
-    return _guard("list_media", {"account": account, "limit": limit}, _impl)
+        lim = V.validate_limit(limit, ceiling=CEIL_MEDIA, all_ceiling=CEIL_MEDIA)
+        cur = V.validate_cursor(after)
+        start_dt = V.validate_date(since, field="since")
+        end_dt = V.validate_date(until, field="until", end_of_day=True)
+        if start_dt and end_dt and start_dt > end_dt:
+            raise V.ValidationError("since must be on or before until")
+
+        def too_old(item: dict[str, Any]) -> bool:
+            ts = item.get("timestamp")
+            return bool(start_dt and ts and V.parse_graph_time(ts) < start_dt)
+
+        items, cursor = client.paginate(f"{acct.ig_user_id}/media", fields=MEDIA_FIELDS,
+                                        max_items=lim, after=cur, stop=too_old if start_dt else None)
+        if end_dt:
+            items = [m for m in items if not m.get("timestamp") or V.parse_graph_time(m["timestamp"]) <= end_dt]
+        return _paged({"ok": True, "account": acct.label}, items, cursor, "media")
+    return _guard("list_media", {"account": account, "limit": limit, "since": since, "until": until}, _impl)
 
 
 @mcp.tool()
@@ -503,14 +535,19 @@ def publish_story(image_url: str | None = None, video_url: str | None = None,
 # ================================ COMMENTS ================================ #
 
 @mcp.tool()
-def get_comments(media_id: str, account: str | None = None, *, limit: int = 25) -> dict[str, Any]:
-    """List comments on a media object (text, username, timestamp, like_count, hidden)."""
+def get_comments(media_id: str, account: str | None = None, *, limit: int | str = 25,
+                 after: str | None = None) -> dict[str, Any]:
+    """List comments on a post (text, username, timestamp, like_count, hidden).
+
+    limit: 1-5000 or "all". Returns next_cursor when more comments exist.
+    """
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         mid = V.validate_graph_id(media_id, field="media_id")
-        lim = V.validate_limit(limit)
-        items = client.get_paginated(f"{mid}/comments", fields=COMMENT_FIELDS, limit=lim, max_items=lim)
-        return {"ok": True, "account": acct.label, "media_id": mid, "count": len(items), "comments": items}
+        lim = V.validate_limit(limit, ceiling=CEIL_COMMENTS, all_ceiling=CEIL_COMMENTS)
+        items, cursor = client.paginate(f"{mid}/comments", fields=COMMENT_FIELDS, max_items=lim,
+                                        after=V.validate_cursor(after))
+        return _paged({"ok": True, "account": acct.label, "media_id": mid}, items, cursor, "comments")
     return _guard("get_comments", {"media_id": media_id, "account": account, "limit": limit}, _impl)
 
 
@@ -566,8 +603,9 @@ def search_hashtag(hashtag: str, account: str | None = None) -> dict[str, Any]:
 
 @mcp.tool()
 def get_hashtag_media(hashtag_id: str, account: str | None = None, *,
-                      edge: str = "top_media", limit: int = 25) -> dict[str, Any]:
-    """Recent or top media for a hashtag id. edge=top_media|recent_media. limit 1-100.
+                      edge: str = "top_media", limit: int | str = 25,
+                      after: str | None = None) -> dict[str, Any]:
+    """Recent or top media for a hashtag id. edge=top_media|recent_media. limit 1-1000 or "all".
 
     Get the hashtag_id from search_hashtag first. Subject to Meta's 30-unique-hashtags
     per-7-days query limit per account.
@@ -576,48 +614,76 @@ def get_hashtag_media(hashtag_id: str, account: str | None = None, *,
         client, acct = auth.client_for(account)
         hid = V.validate_graph_id(hashtag_id, field="hashtag_id")
         e = V.validate_enum(edge, {"top_media", "recent_media"}, field="edge", default="top_media")
-        lim = V.validate_limit(limit)
-        items = client.get_paginated(f"{hid}/{e}", user_id=acct.ig_user_id,
-                                     fields="id,caption,media_type,permalink,like_count,comments_count,timestamp",
-                                     limit=lim, max_items=lim)
-        return {"ok": True, "account": acct.label, "hashtag_id": hid, "edge": e,
-                "count": len(items), "media": items}
+        lim = V.validate_limit(limit, ceiling=CEIL_TAGS, all_ceiling=CEIL_TAGS)
+        items, cursor = client.paginate(f"{hid}/{e}", user_id=acct.ig_user_id,
+                                        fields="id,caption,media_type,permalink,like_count,comments_count,timestamp",
+                                        max_items=lim, after=V.validate_cursor(after), page_size=50)
+        return _paged({"ok": True, "account": acct.label, "hashtag_id": hid, "edge": e},
+                      items, cursor, "media")
     return _guard("get_hashtag_media", {"hashtag_id": hashtag_id, "edge": edge, "limit": limit,
                                         "account": account}, _impl)
 
 
 @mcp.tool()
-def get_mentions(account: str | None = None, *, limit: int = 25) -> dict[str, Any]:
-    """List recent media where the account is @-mentioned (tags edge)."""
+def get_mentions(account: str | None = None, *, limit: int | str = 25,
+                 after: str | None = None) -> dict[str, Any]:
+    """List media where the account is tagged/@-mentioned. limit 1-1000 or "all"."""
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
-        lim = V.validate_limit(limit)
-        items = client.get_paginated(f"{acct.ig_user_id}/tags", fields=MEDIA_FIELDS, limit=lim, max_items=lim)
-        return {"ok": True, "account": acct.label, "count": len(items), "media": items}
+        lim = V.validate_limit(limit, ceiling=CEIL_TAGS, all_ceiling=CEIL_TAGS)
+        items, cursor = client.paginate(f"{acct.ig_user_id}/tags", fields=MEDIA_FIELDS, max_items=lim,
+                                        after=V.validate_cursor(after))
+        return _paged({"ok": True, "account": acct.label}, items, cursor, "media")
     return _guard("get_mentions", {"account": account, "limit": limit}, _impl)
+
+
+BD_PROFILE_FIELDS = ("username,name,biography,followers_count,follows_count,media_count,"
+                     "profile_picture_url,website")
+BD_MEDIA_FIELDS = "id,caption,media_type,media_product_type,permalink,like_count,comments_count,timestamp"
 
 
 @mcp.tool()
 def business_discovery(username: str, account: str | None = None, *, with_media: bool = False,
-                       media_limit: int = 12) -> dict[str, Any]:
-    """Public profile + (optionally) recent media for ANY business/creator account by username.
+                       media_limit: int | str = 12) -> dict[str, Any]:
+    """Public profile + (optionally) recent posts of ANY business/creator account by username.
 
-    Read-only competitor/prospect research via the business_discovery edge. Only works for
-    Professional accounts (not personal). with_media pulls up to media_limit recent posts.
+    Read-only competitor/prospect research. Only works for Professional accounts.
+    with_media pulls up to media_limit recent posts (1-500 or "all"), paging as needed.
     """
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         uname = V.validate_username(username)
-        fields = "business_discovery.username(" + uname + "){" + \
-                 "username,name,biography,followers_count,follows_count,media_count,profile_picture_url,website"
+        lim = V.validate_limit(media_limit, ceiling=CEIL_DISCOVERY, all_ceiling=CEIL_DISCOVERY,
+                               default=12, field="media_limit") if with_media else 0
+        profile: dict[str, Any] | None = None
+        posts: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            fields = f"business_discovery.username({uname}){{{BD_PROFILE_FIELDS}"
+            if with_media:
+                n = min(100, lim - len(posts))
+                fields += f",media.limit({n})" + (f".after({cursor})" if cursor else "") + f"{{{BD_MEDIA_FIELDS}}}"
+            fields += "}"
+            bd = client.get(acct.ig_user_id, fields=fields).get("business_discovery", {})
+            if profile is None:
+                profile = {k: v for k, v in bd.items() if k != "media"}
+            if not with_media:
+                break
+            media = bd.get("media") or {}
+            batch = media.get("data") or []
+            posts.extend(batch)
+            cursor = ((media.get("paging") or {}).get("cursors") or {}).get("after")
+            if not batch or not cursor or len(posts) >= lim:
+                break
+            cursor = V.validate_cursor(cursor, field="cursor")
+        result: dict[str, Any] = dict(profile or {})
         if with_media:
-            lim = V.validate_limit(media_limit, ceiling=50)
-            fields += (".media.limit(" + str(lim) + "){id,caption,media_type,permalink,like_count,"
-                       "comments_count,timestamp}")
-        fields += "}"
-        res = client.get(acct.ig_user_id, fields=fields)
-        return {"ok": True, "account": acct.label, "target": uname,
-                "business_discovery": res.get("business_discovery", {})}
+            result["media"] = {"data": posts[:lim]}
+        out: dict[str, Any] = {"ok": True, "account": acct.label, "target": uname,
+                               "business_discovery": result}
+        if with_media and cursor and len(posts) >= lim:
+            out["truncated"] = True
+        return out
     return _guard("business_discovery", {"username": username, "with_media": with_media,
                                          "account": account}, _impl)
 
@@ -650,32 +716,38 @@ def _page_dm_client(client, acct):
 
 
 @mcp.tool()
-def list_conversations(account: str | None = None, *, limit: int = 5) -> dict[str, Any]:
+def list_conversations(account: str | None = None, *, limit: int | str = 5,
+                       after: str | None = None) -> dict[str, Any]:
     """List Instagram DM conversations (newest first) with participant usernames.
-    REQUIRES Meta App Review (instagram_manage_messages). limit 1-25 (default 5).
+    REQUIRES Meta App Review (instagram_manage_messages). limit 1-200 or "all" (default 5).
     Fetched one conversation per request: Meta rejects larger pages with
     'Please reduce the amount of data you're asking for'."""
     def _impl() -> dict[str, Any]:
         _require_dm()
         client, acct = auth.client_for(account)
-        lim = V.validate_limit(limit, ceiling=25)
+        lim = V.validate_limit(limit, ceiling=CEIL_CONVERSATIONS, all_ceiling=CEIL_CONVERSATIONS)
         pclient, page_id = _page_dm_client(client, acct)
         from instagram_mcp import graph_client as _gc
         items: list = []
         page = pclient.get(f"{page_id}/conversations", platform="instagram",
-                           fields="id,updated_time", limit=1)
+                           fields="id,updated_time", limit=1, after=V.validate_cursor(after))
         note = None
+        nxt: str | None = None
         while True:
             items.extend(page.get("data") or [])
-            after = (page.get("paging") or {}).get("cursors", {}).get("after")
-            if len(items) >= lim or not after or not (page.get("paging") or {}).get("next"):
+            nxt = (page.get("paging") or {}).get("cursors", {}).get("after")
+            if not nxt or not (page.get("paging") or {}).get("next"):
+                nxt = None
+                break
+            if len(items) >= lim:
                 break
             try:  # later pages can hang in dev mode (hidden non-role conversations)
                 short = _gc.GraphClient(pclient._token, base_host=acct.base_host,
                                         app_secret=acct.app_secret, timeout=20.0)
                 page = short.get(f"{page_id}/conversations", platform="instagram",
-                                 fields="id,updated_time", limit=1, after=after)
+                                 fields="id,updated_time", limit=1, after=nxt)
             except Exception:
+                nxt = None
                 note = "stopped early: Meta did not return more conversations (normal in development mode)"
                 break
         items = items[:lim]
@@ -684,8 +756,8 @@ def list_conversations(account: str | None = None, *, limit: int = 5) -> dict[st
                 parts = pclient.get(c["id"], fields="participants").get("participants", {}).get("data", [])
                 c["participants"] = [{"username": p.get("username"), "id": p.get("id")} for p in parts]
             except Exception as exc:  # keep listing even if one lookup fails
-                c["participants_error"] = str(exc)
-        out = {"ok": True, "account": acct.label, "count": len(items), "conversations": items}
+                c["participants_error"] = audit.sanitize_error(str(exc))
+        out = _paged({"ok": True, "account": acct.label}, items, nxt, "conversations")
         if note:
             out["note"] = note
         return out
@@ -700,11 +772,11 @@ def get_messages(conversation_id: str, account: str | None = None, *, limit: int
         _require_dm()
         client, acct = auth.client_for(account)
         cid = V.validate_conversation_id(conversation_id)
-        lim = V.validate_limit(limit, ceiling=25)
+        lim = V.validate_limit(limit, ceiling=CEIL_MESSAGES, all_ceiling=CEIL_MESSAGES)
         pclient, _ = _page_dm_client(client, acct)
         res = pclient.get(cid, fields="messages.limit(" + str(lim) + "){id,created_time,from,to,message}")
         return {"ok": True, "account": acct.label, "conversation_id": cid,
-                "messages": (res.get("messages") or {}).get("data", [])}
+                "messages": ((res.get("messages") or {}).get("data") or [])[:lim]}
     return _guard("get_messages", {"conversation_id": conversation_id, "account": account, "limit": limit}, _impl)
 
 

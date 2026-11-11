@@ -232,6 +232,39 @@ class GraphClient:
         clean = {k: v for k, v in params.items() if v is not None}
         return self._request("DELETE", path, params=clean)
 
+    def paginate(
+        self,
+        path: str,
+        *,
+        max_items: int,
+        after: str | None = None,
+        page_size: int = 100,
+        stop: Any = None,
+        **params: Any,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Walk cursor pages until max_items, the end, or stop(item) is true.
+
+        Returns (items, next_cursor). next_cursor is None when nothing is left (or the
+        walk was stopped by `stop`); otherwise pass it back as `after` to resume.
+        """
+        out: list[dict[str, Any]] = []
+        cursor = after
+        while True:
+            size = max(1, min(page_size, max_items - len(out)))
+            page = self.get(path, limit=size, after=cursor, **params)
+            data = page.get("data") or []
+            for item in data:
+                if stop is not None and stop(item):
+                    return out, None
+                out.append(item)
+            paging = page.get("paging") or {}
+            nxt = (paging.get("cursors") or {}).get("after")
+            if not data or not nxt or not paging.get("next"):
+                return out, None
+            if len(out) >= max_items:
+                return out[:max_items], nxt
+            cursor = nxt
+
     def get_paginated(
         self,
         path: str,
