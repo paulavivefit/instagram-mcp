@@ -32,6 +32,10 @@ import httpx
 GRAPH_VERSION = os.environ.get("INSTAGRAM_MCP_GRAPH_VERSION", "v21.0")
 DEFAULT_TIMEOUT = float(os.environ.get("INSTAGRAM_MCP_TIMEOUT", "30"))
 
+# Test seam: when set (tests only), every GraphClient sends through this transport
+# instead of the network. Production leaves it None.
+DEFAULT_TRANSPORT: httpx.BaseTransport | None = None
+
 # The ONLY hosts this client will ever contact.
 ALLOWED_HOSTS: frozenset[str] = frozenset({"graph.facebook.com", "graph.instagram.com"})
 
@@ -149,6 +153,7 @@ class GraphClient:
         base_host: str = "graph.facebook.com",
         app_secret: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         if base_host not in ALLOWED_HOSTS:
             raise GraphAPIError(
@@ -161,6 +166,7 @@ class GraphClient:
         self._base = base_host
         self._app_secret = app_secret
         self._timeout = timeout
+        self._transport = transport
 
     def _appsecret_proof(self) -> str | None:
         """HMAC-SHA256(token) keyed by app_secret — Meta's recommended call hardening."""
@@ -198,7 +204,8 @@ class GraphClient:
         query = dict(params or {})
         query.update(self._auth_params())
         try:
-            with httpx.Client(timeout=self._timeout) as client:
+            with httpx.Client(timeout=self._timeout,
+                              transport=self._transport or DEFAULT_TRANSPORT) as client:
                 resp = client.request(method, url, params=query, data=data)
         except httpx.TimeoutException as exc:
             raise GraphAPIError(f"Graph API request timed out after {self._timeout}s", error_class="timeout") from exc

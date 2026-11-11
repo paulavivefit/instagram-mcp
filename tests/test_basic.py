@@ -10,7 +10,7 @@ Covers:
   - SSRF: assert_safe_host blocks private/loopback/link-local/metadata IPs
   - GraphClient pins egress to the Meta host allow-list
   - Graph error envelope -> stable error_class (oauth / rate_limited / not_found)
-  - server tool registry contains all 25 tools
+  - server tool registry contains all 29 tools
   - healthcheck with no account returns ok=false + hint
   - DM tools fail loud with error_class="needs_app_review" when not enabled
 """
@@ -25,21 +25,6 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-
-
-@pytest.fixture(autouse=True)
-def _isolate_env(tmp_path, monkeypatch):
-    """Every test runs against a fresh tmp accounts file + tmp audit log, no real token."""
-    monkeypatch.setenv("INSTAGRAM_MCP_ACCOUNTS_PATH", str(tmp_path / "accounts.json"))
-    monkeypatch.setenv("INSTAGRAM_MCP_AUDIT_PATH", str(tmp_path / "audit.log.jsonl"))
-    monkeypatch.delenv("INSTAGRAM_MCP_ACCESS_TOKEN", raising=False)
-    monkeypatch.delenv("INSTAGRAM_MCP_IG_USER_ID", raising=False)
-    monkeypatch.delenv("INSTAGRAM_MCP_DM_ENABLED", raising=False)
-    for mod in list(sys.modules):
-        if mod in {"instagram_mcp", "instagram_mcp.audit", "instagram_mcp.auth",
-                   "instagram_mcp.graph_client", "instagram_mcp.validators",
-                   "instagram_mcp.server"}:
-            del sys.modules[mod]
 
 
 # --------------------------------- imports --------------------------------- #
@@ -302,3 +287,13 @@ def test_dm_enabled_passes_gate_then_needs_account(monkeypatch):
     res = _call(server.list_conversations)()
     assert res["ok"] is False
     assert res["error_class"] != "needs_app_review"  # got past the gate; now an auth error
+
+
+def test_validate_conversation_id():
+    from instagram_mcp import validators as V
+    good = "aWdfZAG06MTpJR01lc3NhZA2VUaHJlYWQ6MTc4NDE0MDE1NTU3MDQxNDk6MzQw-_=="
+    assert V.validate_conversation_id(good) == good
+    assert V.validate_conversation_id("  t_123  ") == "t_123"
+    for bad in ["", "a/b", "a?b", "a&b", "a b", "x" * 257, None]:
+        with pytest.raises(V.ValidationError):
+            V.validate_conversation_id(bad)

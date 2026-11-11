@@ -579,28 +579,82 @@ def business_discovery(username: str, account: str | None = None, *, with_media:
 # with the app-review hint unless INSTAGRAM_MCP_DM_ENABLED=1 AND the token carries
 # the scope. Scaffolded (not stubbed) so enabling is a one-flag flip post-approval.
 
+_PAGE_CACHE: dict = {}
+
+
+def _page_dm_client(client, acct):
+    """IG messaging (Facebook-Login path) works reliably only with the PAGE token,
+    on the Page node. Resolve the Page linked to this IG account and return
+    (page_client, page_id). Slow Meta responses -> generous timeout."""
+    from instagram_mcp import graph_client as _gc
+    if acct.label in _PAGE_CACHE:
+        return _PAGE_CACHE[acct.label]
+    slow = _gc.GraphClient(acct.access_token, base_host=acct.base_host,
+                           app_secret=acct.app_secret, timeout=120.0)
+    res = slow.get("me/accounts", fields="id,access_token,instagram_business_account", limit=100)
+    for pg in res.get("data", []):
+        if (pg.get("instagram_business_account") or {}).get("id") == acct.ig_user_id:
+            out = (_gc.GraphClient(pg["access_token"], base_host=acct.base_host,
+                                   app_secret=acct.app_secret, timeout=120.0), pg["id"])
+            _PAGE_CACHE[acct.label] = out
+            return out
+    raise V.ValidationError("no Facebook Page linked to this Instagram account was found in me/accounts")
+
+
 @mcp.tool()
-def list_conversations(account: str | None = None, *, limit: int = 25) -> dict[str, Any]:
-    """List Instagram DM conversations. REQUIRES Meta App Review (instagram_manage_messages)."""
+def list_conversations(account: str | None = None, *, limit: int = 5) -> dict[str, Any]:
+    """List Instagram DM conversations (newest first) with participant usernames.
+    REQUIRES Meta App Review (instagram_manage_messages). limit 1-25 (default 5).
+    Fetched one conversation per request: Meta rejects larger pages with
+    'Please reduce the amount of data you're asking for'."""
     def _impl() -> dict[str, Any]:
         _require_dm()
         client, acct = auth.client_for(account)
-        lim = V.validate_limit(limit)
-        items = client.get_paginated(f"{acct.ig_user_id}/conversations", platform="instagram",
-                                      fields="id,updated_time,participants", limit=lim, max_items=lim)
-        return {"ok": True, "account": acct.label, "count": len(items), "conversations": items}
+        lim = V.validate_limit(limit, ceiling=25)
+        pclient, page_id = _page_dm_client(client, acct)
+        from instagram_mcp import graph_client as _gc
+        items: list = []
+        page = pclient.get(f"{page_id}/conversations", platform="instagram",
+                           fields="id,updated_time", limit=1)
+        note = None
+        while True:
+            items.extend(page.get("data") or [])
+            after = (page.get("paging") or {}).get("cursors", {}).get("after")
+            if len(items) >= lim or not after or not (page.get("paging") or {}).get("next"):
+                break
+            try:  # later pages can hang in dev mode (hidden non-role conversations)
+                short = _gc.GraphClient(pclient._token, base_host=acct.base_host,
+                                        app_secret=acct.app_secret, timeout=20.0)
+                page = short.get(f"{page_id}/conversations", platform="instagram",
+                                 fields="id,updated_time", limit=1, after=after)
+            except Exception:
+                note = "stopped early: Meta did not return more conversations (normal in development mode)"
+                break
+        items = items[:lim]
+        for c in items:
+            try:
+                parts = pclient.get(c["id"], fields="participants").get("participants", {}).get("data", [])
+                c["participants"] = [{"username": p.get("username"), "id": p.get("id")} for p in parts]
+            except Exception as exc:  # keep listing even if one lookup fails
+                c["participants_error"] = str(exc)
+        out = {"ok": True, "account": acct.label, "count": len(items), "conversations": items}
+        if note:
+            out["note"] = note
+        return out
     return _guard("list_conversations", {"account": account, "limit": limit}, _impl)
 
 
 @mcp.tool()
-def get_messages(conversation_id: str, account: str | None = None, *, limit: int = 25) -> dict[str, Any]:
-    """Read messages in a DM conversation. REQUIRES Meta App Review (instagram_manage_messages)."""
+def get_messages(conversation_id: str, account: str | None = None, *, limit: int = 10) -> dict[str, Any]:
+    """Read messages in a DM conversation, newest first. limit 1-25 (default 10).
+    REQUIRES Meta App Review (instagram_manage_messages)."""
     def _impl() -> dict[str, Any]:
         _require_dm()
         client, acct = auth.client_for(account)
-        cid = V.validate_graph_id(conversation_id, field="conversation_id")
-        lim = V.validate_limit(limit)
-        res = client.get(cid, fields="messages.limit(" + str(lim) + "){id,created_time,from,to,message}")
+        cid = V.validate_conversation_id(conversation_id)
+        lim = V.validate_limit(limit, ceiling=25)
+        pclient, _ = _page_dm_client(client, acct)
+        res = pclient.get(cid, fields="messages.limit(" + str(lim) + "){id,created_time,from,to,message}")
         return {"ok": True, "account": acct.label, "conversation_id": cid,
                 "messages": (res.get("messages") or {}).get("data", [])}
     return _guard("get_messages", {"conversation_id": conversation_id, "account": account, "limit": limit}, _impl)
@@ -610,8 +664,9 @@ def get_messages(conversation_id: str, account: str | None = None, *, limit: int
 def send_message(recipient_id: str, text: str, account: str | None = None) -> dict[str, Any]:
     """Send a DM. REQUIRES Meta App Review + the 24-hour standard-messaging window.
 
-    recipient_id is the IGSID (Instagram-scoped user id) of the recipient. Outside the
-    24h customer-service window a paid message tag is required (not handled here).
+    recipient_id is the IGSID (Instagram-scoped user id) of the recipient — the
+    participant "id" from list_conversations / "from.id" from get_messages.
+    Outside the 24h customer-service window a message tag is required (not handled here).
     """
     def _impl() -> dict[str, Any]:
         _require_dm()
@@ -620,8 +675,9 @@ def send_message(recipient_id: str, text: str, account: str | None = None) -> di
         msg = V.validate_caption(text, field="text")
         if not msg:
             raise V.ValidationError("text must be non-empty")
-        res = client.post(f"{acct.ig_user_id}/messages",
-                          recipient='{"id":"' + rid + '"}', message='{"text":' + _json_str(msg) + '}')
+        pclient, page_id = _page_dm_client(client, acct)
+        res = pclient.post(f"{page_id}/messages",
+                           recipient='{"id":"' + rid + '"}', message='{"text":' + _json_str(msg) + '}')
         return {"ok": True, "account": acct.label, "recipient_id": rid, "result": res}
     return _guard("send_message", {"recipient_id": recipient_id, "text": V.truncate(text), "account": account}, _impl)
 
