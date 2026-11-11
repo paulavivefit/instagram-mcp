@@ -1140,38 +1140,90 @@ def get_messages(conversation_id: str, account: str | None = None, *, limit: int
         cid = V.validate_conversation_id(conversation_id)
         lim = V.validate_limit(limit, ceiling=CEIL_MESSAGES, all_ceiling=CEIL_MESSAGES)
         pclient, _ = _page_dm_client(client, acct)
-        res = pclient.get(cid, fields="messages.limit(" + str(lim) + "){id,created_time,from,to,message}")
+        res = pclient.get(cid, fields="messages.limit(" + str(lim) + "){" + MESSAGE_FIELDS + "}")
         return {"ok": True, "account": acct.label, "conversation_id": cid,
                 "messages": ((res.get("messages") or {}).get("data") or [])[:lim]}
     return _guard("get_messages", {"conversation_id": conversation_id, "account": account, "limit": limit}, _impl)
 
 
-@mcp.tool()
-def send_message(recipient_id: str, text: str, account: str | None = None) -> dict[str, Any]:
-    """Send a DM. REQUIRES Meta App Review + the 24-hour standard-messaging window.
+MESSAGE_FIELDS = "id,created_time,from,to,message,attachments,shares,story,reactions,is_unsupported"
+DM_TEXT_MAX = 1000
+DM_TAGS = frozenset({"HUMAN_AGENT"})
+SENDER_ACTIONS = frozenset({"mark_seen", "typing_on", "typing_off"})
+OUTSIDE_WINDOW_HINT = ("Instagram only allows replies within 24 hours of the customer's last message. "
+                       "Up to 7 days, a human-written reply can be sent with tag=\"HUMAN_AGENT\" "
+                       "(requires the human_agent permission from Meta App Review).")
 
-    recipient_id is the IGSID (Instagram-scoped user id) of the recipient — the
-    participant "id" from list_conversations / "from.id" from get_messages.
-    Outside the 24h customer-service window a message tag is required (not handled here).
+
+def _is_outside_window(exc: graph_client.GraphAPIError) -> bool:
+    msg = str(exc).lower()
+    return exc.subcode in {2534022, 2018278} or "outside of allowed window" in msg or "outside the allowed window" in msg
+
+
+@mcp.tool()
+def send_message(recipient_id: str, text: str | None = None, account: str | None = None, *,
+                 image_url: str | None = None, tag: str | None = None) -> dict[str, Any]:
+    """Send a DM reply. REQUIRES Meta App Review; only to people who messaged first.
+
+    recipient_id: the customer's id (participant "id" from list_conversations, or
+    "from.id" from get_messages). text (<= 1000 chars) and/or image_url (public https;
+    sent as a second message when both are given). Within 24 h of the customer's last
+    message no tag is needed; up to 7 days later pass tag="HUMAN_AGENT" for a
+    human-written reply (needs the human_agent permission).
     """
     def _impl() -> dict[str, Any]:
+        import json
         _require_dm()
         client, acct = auth.client_for(account)
         rid = V.validate_graph_id(recipient_id, field="recipient_id")
-        msg = V.validate_caption(text, field="text")
-        if not msg:
-            raise V.ValidationError("text must be non-empty")
+        if text is not None and (not isinstance(text, str) or len(text) > DM_TEXT_MAX):
+            raise V.ValidationError(f"text must be at most {DM_TEXT_MAX} characters")
+        img = V.validate_public_https_url(image_url, field="image_url") if image_url else None
+        if not (text and text.strip()) and not img:
+            raise V.ValidationError("pass text and/or image_url")
+        if tag is not None and tag not in DM_TAGS:
+            raise V.ValidationError(f"tag must be one of {sorted(DM_TAGS)}")
+        routing = {"messaging_type": "MESSAGE_TAG", "tag": tag} if tag else {"messaging_type": "RESPONSE"}
+        bodies = []
+        if text and text.strip():
+            bodies.append({"text": text})
+        if img:
+            bodies.append({"attachment": {"type": "image", "payload": {"url": img}}})
         pclient, page_id = _page_dm_client(client, acct)
-        res = pclient.post(f"{page_id}/messages",
-                           recipient='{"id":"' + rid + '"}', message='{"text":' + _json_str(msg) + '}')
-        return {"ok": True, "account": acct.label, "recipient_id": rid, "result": res}
-    return _guard("send_message", {"recipient_id": recipient_id, "text": V.truncate(text), "account": account}, _impl)
+        results = []
+        for body in bodies:
+            try:
+                results.append(pclient.post(f"{page_id}/messages", recipient=json.dumps({"id": rid}),
+                                            message=json.dumps(body, ensure_ascii=False), **routing))
+            except graph_client.GraphAPIError as exc:
+                if _is_outside_window(exc):
+                    raise graph_client.GraphAPIError(str(exc), error_class="outside_window",
+                                                     code=exc.code, subcode=exc.subcode,
+                                                     extra={"hint": OUTSIDE_WINDOW_HINT,
+                                                            "sent_before_error": len(results)}) from exc
+                raise
+        return {"ok": True, "account": acct.label, "recipient_id": rid, "tag": tag,
+                "message_ids": [r.get("message_id") for r in results], "result": results[-1]}
+    return _guard("send_message", {"recipient_id": recipient_id, "text": V.truncate(text or ""),
+                                   "image_url": image_url, "tag": tag, "account": account}, _impl)
 
 
-def _json_str(s: str) -> str:
-    """Minimal JSON string encoder for the messages payload."""
-    import json
-    return json.dumps(s, ensure_ascii=False)
+@mcp.tool()
+def mark_seen(recipient_id: str, account: str | None = None, *, action: str = "mark_seen") -> dict[str, Any]:
+    """Mark a customer's conversation as seen, or show a typing indicator.
+
+    action: mark_seen (default) | typing_on | typing_off. REQUIRES Meta App Review.
+    """
+    def _impl() -> dict[str, Any]:
+        import json
+        _require_dm()
+        client, acct = auth.client_for(account)
+        rid = V.validate_graph_id(recipient_id, field="recipient_id")
+        act = V.validate_enum(action, set(SENDER_ACTIONS), field="action", default="mark_seen")
+        pclient, page_id = _page_dm_client(client, acct)
+        res = pclient.post(f"{page_id}/messages", recipient=json.dumps({"id": rid}), sender_action=act)
+        return {"ok": True, "account": acct.label, "recipient_id": rid, "action": act, "result": res}
+    return _guard("mark_seen", {"recipient_id": recipient_id, "action": action, "account": account}, _impl)
 
 
 def run() -> None:
