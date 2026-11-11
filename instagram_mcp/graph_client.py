@@ -329,12 +329,17 @@ class GraphClient:
         after: str | None = None,
         page_size: int = 100,
         stop: Any = None,
+        skip: Any = None,
         **params: Any,
     ) -> tuple[list[dict[str, Any]], str | None]:
         """Walk cursor pages until max_items, the end, or stop(item) is true.
 
+        skip(item) -> True drops an item without counting it toward max_items.
         Returns (items, next_cursor). next_cursor is None when nothing is left (or the
         walk was stopped by `stop`); otherwise pass it back as `after` to resume.
+        A page is never cut in half (Meta's cursor points past the whole page), so if
+        Meta returns more than asked the result can slightly exceed max_items rather
+        than silently dropping items.
         """
         out: list[dict[str, Any]] = []
         cursor = after
@@ -345,13 +350,15 @@ class GraphClient:
             for item in data:
                 if stop is not None and stop(item):
                     return out, None
+                if skip is not None and skip(item):
+                    continue
                 out.append(item)
             paging = page.get("paging") or {}
             nxt = (paging.get("cursors") or {}).get("after")
             if not data or not nxt or not paging.get("next"):
                 return out, None
             if len(out) >= max_items:
-                return out[:max_items], nxt
+                return out, nxt
             cursor = nxt
 
     def get_paginated(

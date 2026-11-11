@@ -238,7 +238,7 @@ def validate_limit(value: int | str | None, *, field: str = "limit", default: in
     return value
 
 
-_CURSOR_RE = re.compile(r"^[0-9A-Za-z_\-=]{1,512}$")
+_CURSOR_RE = re.compile(r"^[0-9A-Za-z_\-=]{1,4096}$")
 
 
 def validate_cursor(value: str | None, *, field: str = "after") -> str | None:
