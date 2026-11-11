@@ -176,10 +176,13 @@ def _publish_container(client: graph_client.GraphClient, ig_user_id: str, contai
     try:
         published = client.post(f"{ig_user_id}/media_publish", creation_id=container_id)
     except graph_client.GraphAPIError as exc:
+        uncertain = exc.error_class in {"timeout", "network"} or (exc.http_status or 0) >= 500
+        hint = PUBLISH_UNCERTAIN_HINT if uncertain else (
+            "Meta rejected the publish; nothing was posted. Fix the cause, then call "
+            "publish_container(container_id) to retry without re-uploading.")
         raise graph_client.GraphAPIError(str(exc), error_class=exc.error_class, code=exc.code,
                                          subcode=exc.subcode, http_status=exc.http_status,
-                                         extra={"container_id": container_id,
-                                                "hint": PUBLISH_UNCERTAIN_HINT}) from exc
+                                         extra={"container_id": container_id, "hint": hint}) from exc
     return {"ok": True, "media_id": published.get("id"), "container_id": container_id}
 
 
@@ -327,6 +330,15 @@ def list_media(account: str | None = None, *, limit: int | str = 25, after: str 
         items, cursor = client.paginate(f"{acct.ig_user_id}/media", fields=MEDIA_FIELDS,
                                         max_items=lim, after=cur, stop=too_old if start_dt else None,
                                         skip=too_new if end_dt else None)
+        if getattr(client, "last_cut", False) and items:
+            from datetime import timedelta
+            last = V.parse_graph_time(items[-1]["timestamp"])
+            out = _paged({"ok": True, "account": acct.label}, items, None, "media")
+            out["truncated"] = True
+            nxt_until = (last - timedelta(seconds=1)).isoformat()
+            out["next_until"] = nxt_until
+            out["hint"] = f"More posts exist. To continue, call list_media again with until={nxt_until!r}."
+            return out
         return _paged({"ok": True, "account": acct.label}, items, cursor, "media")
     return _guard("list_media", {"account": account, "limit": limit, "since": since, "until": until}, _impl)
 

@@ -147,3 +147,23 @@ def test_long_cursor_accepted():
     from instagram_mcp import validators as V
     assert V.validate_cursor("Q" * 1500)
 
+
+
+def test_until_filter_uses_full_pages(account):
+    from instagram_mcp import server
+    from tests.test_pagination import _media, _paged
+    account.route("GET", rf"^/{FAKE_IG_ID}/media$", _paged(_media(320)))  # 2026-11-30 back daily
+    res = call(server.list_media)(limit=5, until="2026-06-01")
+    assert res["count"] == 5
+    calls = account.calls("GET", rf"^/{FAKE_IG_ID}/media$")
+    assert len(calls) <= 4 and all(c.params["limit"] == "100" for c in calls)
+
+
+def test_publish_rejection_has_no_may_be_live_hint(account):
+    from instagram_mcp import server
+    account.route("POST", rf"^/{FAKE_IG_ID}/media$", {"id": "C9"})
+    account.route("POST", rf"^/{FAKE_IG_ID}/media_publish$",
+                  (400, {"error": {"message": "(#9) daily posting limit reached", "code": 9}}))
+    res = call(server.publish_image)("https://cdn.example.com/a.jpg")
+    assert res["ok"] is False and res["container_id"] == "C9"
+    assert "MAY already be live" not in res.get("hint", "")
