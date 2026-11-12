@@ -87,6 +87,13 @@ CollaboratorsArg = Annotated[
 LocationIdArg = Annotated[
     str | int | None, Field(description="Facebook location Page id to show as the post location (numeric). Optional.")
 ]
+PrepareOnlyArg = Annotated[
+    bool,
+    Field(
+        description="True to upload and process the post at Instagram without publishing it; "
+        "returns container_id to publish later with publish_container (expires after ~24 h)."
+    ),
+]
 LabelArg = Annotated[
     str, Field(description='Short name for the account, e.g. "vivefit" or "client-a" (letters, digits, - and _).')
 ]
@@ -234,7 +241,20 @@ PUBLISH_UNCERTAIN_HINT = (
 )
 
 
-def _publish_container(client: graph_client.GraphClient, ig_user_id: str, container_id: str) -> dict[str, Any]:
+def _publish_container(
+    client: graph_client.GraphClient, ig_user_id: str, container_id: str, *, prepare_only: bool = False
+) -> dict[str, Any]:
+    if prepare_only:
+        _wait_container_ready(client, container_id)
+        return {
+            "ok": True,
+            "prepared": True,
+            "published": False,
+            "container_id": container_id,
+            "status_code": "FINISHED",
+            "hint": "Prepared at Instagram but NOT published. Call publish_container(container_id) "
+            "to publish it (containers expire after about 24 hours).",
+        }
     try:
         published = client.post(f"{ig_user_id}/media_publish", creation_id=container_id)
     except graph_client.GraphAPIError as exc:
@@ -1102,6 +1122,7 @@ def publish_image(
     ] = None,
     location_id: LocationIdArg = None,
     collaborators: CollaboratorsArg = None,
+    prepare_only: PrepareOnlyArg = False,
 ) -> dict[str, Any]:
     """Publish a single-image post to the feed (publicly visible; the API cannot delete posts).
 
@@ -1124,7 +1145,7 @@ def publish_image(
         }
         container = client.post(f"{acct.ig_user_id}/media", **params)
         cid = container.get("id")
-        return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid)}
+        return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid, prepare_only=prepare_only)}
 
     return _guard(
         "publish_image", {"image_url": image_url, "caption": V.truncate(caption or ""), "account": account}, _impl
@@ -1140,6 +1161,7 @@ def publish_video(
     ],
     caption: CaptionArg = None,
     account: AccountArg = None,
+    prepare_only: PrepareOnlyArg = False,
 ) -> dict[str, Any]:
     """Publish a video post to the feed (publicly visible; the API cannot delete posts).
 
@@ -1155,7 +1177,7 @@ def publish_video(
         container = client.post(f"{acct.ig_user_id}/media", media_type="VIDEO", video_url=url, caption=cap)
         cid = container.get("id")
         _wait_container_ready(client, cid)
-        return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid)}
+        return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid, prepare_only=prepare_only)}
 
     return _guard(
         "publish_video", {"video_url": video_url, "caption": V.truncate(caption or ""), "account": account}, _impl
@@ -1185,6 +1207,7 @@ def publish_reel(
     user_tags: Annotated[
         list[dict[str, Any]] | None, Field(description="People to tag: list of {username}. Optional.")
     ] = None,
+    prepare_only: PrepareOnlyArg = False,
 ) -> dict[str, Any]:
     """Publish a reel (publicly visible; the API cannot delete posts).
 
@@ -1219,7 +1242,7 @@ def publish_reel(
         )
         cid = container.get("id")
         _wait_container_ready(client, cid)
-        return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid)}
+        return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid, prepare_only=prepare_only)}
 
     return _guard(
         "publish_reel",
@@ -1253,6 +1276,7 @@ def publish_carousel(
     *,
     collaborators: CollaboratorsArg = None,
     location_id: LocationIdArg = None,
+    prepare_only: PrepareOnlyArg = False,
 ) -> dict[str, Any]:
     """Publish a carousel of 2-10 images/videos (publicly visible; the API cannot delete posts).
 
@@ -1304,7 +1328,7 @@ def publish_carousel(
         return {
             "account": acct.label,
             "child_count": len(child_ids),
-            **_publish_container(client, acct.ig_user_id, cid),
+            **_publish_container(client, acct.ig_user_id, cid, prepare_only=prepare_only),
         }
 
     return _guard(
@@ -1325,6 +1349,7 @@ def publish_story(
         str | None, Field(description="Public https URL of the story video. Pass this or image_url, not both.")
     ] = None,
     account: AccountArg = None,
+    prepare_only: PrepareOnlyArg = False,
 ) -> dict[str, Any]:
     """Publish a story for 24 hours (publicly visible to followers).
 
@@ -1343,7 +1368,7 @@ def publish_story(
             container = client.post(f"{acct.ig_user_id}/media", media_type="STORIES", video_url=url)
             cid = container.get("id")
             _wait_container_ready(client, cid)
-        return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid)}
+        return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid, prepare_only=prepare_only)}
 
     return _guard("publish_story", {"image_url": image_url, "video_url": video_url, "account": account}, _impl)
 
