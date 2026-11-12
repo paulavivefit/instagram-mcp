@@ -33,8 +33,9 @@ from typing import Any
 
 from instagram_mcp import graph_client
 
-ACCOUNTS_PATH = Path(os.environ.get("INSTAGRAM_MCP_ACCOUNTS_PATH") or
-                     os.path.expanduser("~/.claude/instagram-mcp/accounts.json"))
+ACCOUNTS_PATH = Path(
+    os.environ.get("INSTAGRAM_MCP_ACCOUNTS_PATH") or os.path.expanduser("~/.claude/instagram-mcp/accounts.json")
+)
 TOKENS_FALLBACK_PATH = ACCOUNTS_PATH.parent / "tokens.json"  # chmod 600, fallback only
 KEYCHAIN_SERVICE = "instagram-mcp"
 
@@ -61,14 +62,13 @@ class ResolvedAccount:
     app_secret: str | None
 
     def client(self) -> graph_client.GraphClient:
-        return graph_client.GraphClient(
-            self.access_token, base_host=self.base_host, app_secret=self.app_secret
-        )
+        return graph_client.GraphClient(self.access_token, base_host=self.base_host, app_secret=self.app_secret)
 
 
 # --------------------------------------------------------------------------- #
 # Keychain (macOS) with chmod-600 file fallback
 # --------------------------------------------------------------------------- #
+
 
 def _keychain_available() -> bool:
     return sys.platform == "darwin" and shutil.which("security") is not None
@@ -77,14 +77,17 @@ def _keychain_available() -> bool:
 def _keychain_set(account: str, secret: str) -> None:
     subprocess.run(
         ["security", "add-generic-password", "-U", "-a", account, "-s", KEYCHAIN_SERVICE, "-w", secret],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     )
 
 
 def _keychain_get(account: str) -> str | None:
     res = subprocess.run(
         ["security", "find-generic-password", "-a", account, "-s", KEYCHAIN_SERVICE, "-w"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if res.returncode != 0:
         return None
@@ -94,7 +97,8 @@ def _keychain_get(account: str) -> str | None:
 def _keychain_delete(account: str) -> None:
     subprocess.run(
         ["security", "delete-generic-password", "-a", account, "-s", KEYCHAIN_SERVICE],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
 
 
@@ -146,6 +150,7 @@ def secret_backend() -> str:
 # Metadata file (NO tokens)
 # --------------------------------------------------------------------------- #
 
+
 def _load_meta() -> dict[str, Any]:
     if not ACCOUNTS_PATH.exists():
         return {"accounts": {}, "default": None}
@@ -168,6 +173,7 @@ def _save_meta(meta: dict[str, Any]) -> None:
 # Public API
 # --------------------------------------------------------------------------- #
 
+
 def list_accounts() -> list[dict[str, Any]]:
     """Account metadata only — never tokens.
 
@@ -176,22 +182,26 @@ def list_accounts() -> list[dict[str, Any]]:
     meta = _load_meta()
     out: list[dict[str, Any]] = []
     if os.environ.get(ENV_TOKEN):
-        out.append({
-            "label": "env",
-            "ig_user_id": os.environ.get(ENV_IG_USER_ID),
-            "base_host": os.environ.get(ENV_BASE_HOST, _DEFAULT_BASE),
-            "source": "env",
-            "default": meta.get("default") in (None, "env"),
-        })
+        out.append(
+            {
+                "label": "env",
+                "ig_user_id": os.environ.get(ENV_IG_USER_ID),
+                "base_host": os.environ.get(ENV_BASE_HOST, _DEFAULT_BASE),
+                "source": "env",
+                "default": meta.get("default") in (None, "env"),
+            }
+        )
     for label, info in meta["accounts"].items():
-        out.append({
-            "label": label,
-            "ig_user_id": info.get("ig_user_id"),
-            "base_host": info.get("base_host", _DEFAULT_BASE),
-            "source": "stored",
-            "has_app_secret": bool(info.get("app_secret")),
-            "default": meta.get("default") == label,
-        })
+        out.append(
+            {
+                "label": label,
+                "ig_user_id": info.get("ig_user_id"),
+                "base_host": info.get("base_host", _DEFAULT_BASE),
+                "source": "stored",
+                "has_app_secret": bool(info.get("app_secret")),
+                "default": meta.get("default") == label,
+            }
+        )
     return out
 
 
@@ -219,8 +229,13 @@ def add_account(
     if make_default or meta.get("default") is None:
         meta["default"] = label
     _save_meta(meta)
-    return {"label": label, "ig_user_id": ig_user_id, "base_host": base_host,
-            "default": meta["default"] == label, "secret_backend": secret_backend()}
+    return {
+        "label": label,
+        "ig_user_id": ig_user_id,
+        "base_host": base_host,
+        "default": meta["default"] == label,
+        "secret_backend": secret_backend(),
+    }
 
 
 def remove_account(label: str) -> dict[str, Any]:
@@ -256,8 +271,9 @@ def resolve(label: str | None = None) -> ResolvedAccount:
         uid = os.environ.get(ENV_IG_USER_ID)
         if not uid:
             raise AuthError(f"{ENV_IG_USER_ID} must be set alongside {ENV_TOKEN}")
-        return ResolvedAccount("env", uid, os.environ.get(ENV_BASE_HOST, _DEFAULT_BASE),
-                               token, os.environ.get(ENV_APP_SECRET))
+        return ResolvedAccount(
+            "env", uid, os.environ.get(ENV_BASE_HOST, _DEFAULT_BASE), token, os.environ.get(ENV_APP_SECRET)
+        )
 
     target = label or meta.get("default")
     if not target:
@@ -271,8 +287,7 @@ def resolve(label: str | None = None) -> ResolvedAccount:
     if not token:
         raise AuthError(f"no stored token for account {target!r} ({secret_backend()}) — re-run add_account")
     app_secret = _secret_get(f"{target}::secret") if info.get("app_secret") else None
-    return ResolvedAccount(target, info["ig_user_id"], info.get("base_host", _DEFAULT_BASE),
-                           token, app_secret)
+    return ResolvedAccount(target, info["ig_user_id"], info.get("base_host", _DEFAULT_BASE), token, app_secret)
 
 
 def client_for(label: str | None = None) -> tuple[graph_client.GraphClient, ResolvedAccount]:

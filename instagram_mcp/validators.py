@@ -51,7 +51,9 @@ def validate_graph_id(value: str, *, field: str = "id") -> str:
         raise ValidationError(f"{field} must be a string")
     v = value.strip()
     if not _GRAPH_ID_RE.match(v):
-        raise ValidationError(f"{field} must be a Graph object id (alphanumeric/underscore, <=64; got {truncate(v, 40)!r})")
+        raise ValidationError(
+            f"{field} must be a Graph object id (alphanumeric/underscore, <=64; got {truncate(v, 40)!r})"
+        )
     return v
 
 
@@ -110,6 +112,7 @@ def validate_alt_text(value: str | None) -> str | None:
 def validate_user_tags(value: Any, *, require_xy: bool = True) -> str | None:
     """[{username, x, y}] -> JSON string for the Graph API. x/y are 0..1 (image only)."""
     import json
+
     if value is None:
         return None
     if not isinstance(value, list) or not value:
@@ -133,6 +136,7 @@ def validate_user_tags(value: Any, *, require_xy: bool = True) -> str | None:
 
 def validate_collaborators(value: Any) -> str | None:
     import json
+
     if value is None:
         return None
     if isinstance(value, str):
@@ -160,7 +164,9 @@ def validate_hashtag(value: str, *, field: str = "hashtag") -> str:
         raise ValidationError(f"{field} must be a string")
     v = value.strip().lstrip("#")
     if not _HASHTAG_RE.match(v):
-        raise ValidationError(f"{field} must be alphanumeric/underscore, <=100 chars, no spaces (got {truncate(v, 40)!r})")
+        raise ValidationError(
+            f"{field} must be alphanumeric/underscore, <=100 chars, no spaces (got {truncate(v, 40)!r})"
+        )
     return v
 
 
@@ -170,7 +176,9 @@ def validate_username(value: str, *, field: str = "username") -> str:
         raise ValidationError(f"{field} must be a string")
     v = value.strip().lstrip("@")
     if not re.match(r"^[A-Za-z0-9._]{1,30}$", v):
-        raise ValidationError(f"{field} must be a valid Instagram username (<=30, letters/digits/._; got {truncate(v, 40)!r})")
+        raise ValidationError(
+            f"{field} must be a valid Instagram username (<=30, letters/digits/._; got {truncate(v, 40)!r})"
+        )
     return v
 
 
@@ -214,8 +222,29 @@ def validate_public_https_url(value: str, *, field: str = "media_url") -> str:
     return v
 
 
-def validate_limit(value: int | str | None, *, field: str = "limit", default: int = 25,
-                   ceiling: int = 100, all_ceiling: int | None = None) -> int:
+_IG_CDN_HOSTS = ("cdninstagram.com", "fbcdn.net")
+
+
+def validate_video_url(value: str, *, field: str = "video_url") -> str:
+    """Public https video URL that Instagram will accept as an upload source."""
+    v = validate_public_https_url(value, field=field)
+    host = re.sub(r"^https://", "", v, flags=re.I).split("/", 1)[0].split(":", 1)[0].lower()
+    if any(host == h or host.endswith("." + h) for h in _IG_CDN_HOSTS):
+        raise ValidationError(
+            f"{field} points to Instagram's own CDN ({host}); Meta rejects those as video sources "
+            "(error 2207076). Upload the video file to your own website or storage and use that link."
+        )
+    return v
+
+
+def validate_limit(
+    value: int | str | None,
+    *,
+    field: str = "limit",
+    default: int = 25,
+    ceiling: int = 100,
+    all_ceiling: int | None = None,
+) -> int:
     """Item count: 1..ceiling, or "all" (-> all_ceiling, else ceiling). Default when None.
 
     Numeric strings ("40") are accepted because MCP clients sometimes send numbers as text.
@@ -223,18 +252,18 @@ def validate_limit(value: int | str | None, *, field: str = "limit", default: in
     if value is None:
         return default
     if isinstance(value, bool):
-        raise ValidationError(f"{field} must be an integer or \"all\"")
+        raise ValidationError(f'{field} must be an integer or "all"')
     if isinstance(value, str):
         v = value.strip().lower()
         if v == "all":
             return all_ceiling or ceiling
         if not v.isdigit():
-            raise ValidationError(f"{field} must be an integer or \"all\"")
+            raise ValidationError(f'{field} must be an integer or "all"')
         value = int(v)
     if not isinstance(value, int):
-        raise ValidationError(f"{field} must be an integer or \"all\"")
+        raise ValidationError(f'{field} must be an integer or "all"')
     if value < 1 or value > ceiling:
-        raise ValidationError(f"{field} must be between 1 and {ceiling} (or \"all\")")
+        raise ValidationError(f'{field} must be between 1 and {ceiling} (or "all")')
     return value
 
 
@@ -253,6 +282,7 @@ def validate_cursor(value: str | None, *, field: str = "after") -> str | None:
 def validate_date(value: str | None, *, field: str = "date", end_of_day: bool = False):
     """YYYY-MM-DD or ISO-8601 -> aware UTC datetime. Date-only + end_of_day -> 23:59:59."""
     from datetime import datetime, time, timezone
+
     if value is None or value == "":
         return None
     if not isinstance(value, str):
@@ -271,6 +301,7 @@ def validate_date(value: str | None, *, field: str = "date", end_of_day: bool = 
 def parse_graph_time(value: str):
     """Graph timestamps look like 2026-11-11T18:21:43+0000."""
     from datetime import datetime
+
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
 
 

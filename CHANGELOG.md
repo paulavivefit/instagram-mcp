@@ -3,6 +3,18 @@
 All notable changes to instagram-mcp are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [0.2.1] — 2026-11-12
+
+### Added
+- `prepare_only` on every publish tool (process at Instagram without publishing; finish with `publish_container`).
+- Parameter descriptions, enum choices and MCP safety annotations (title/readOnly/destructive/openWorld) on all 35 tools.
+- `scripts/e2e_live.py`: real-API end-to-end test of every tool over the MCP protocol (public phases behind explicit flags).
+
+### Fixed (found by the real-API e2e run)
+- `publish_video`: Meta rejects media_type=VIDEO for feed posts; now published as a reel shown in the grid.
+- "Invalid user id" (code 110) for untaggable usernames is a parameter error with a hint, not an OAuth error.
+- Clear hints for unusable video sources (Instagram CDN links rejected up front; error 2207076), location pages without an address (2207019), and hashtag search needing Instagram Public Content Access.
+
 ## [0.2.0] — 2026-11-11
 
 Fork release (paulavivefit/instagram-mcp). 35 tools, 117+ tests with an in-memory fake Graph API.

@@ -13,8 +13,14 @@ ACCOUNT_TIME_SERIES = frozenset({"reach", "follower_count", "online_followers"})
 # and Meta only accepts period=day for those (week/days_28 are rejected).
 TOTAL_VALUE_PERIOD = "day"
 
-DEFAULT_ACCOUNT_METRICS = ("reach", "follower_count", "views", "profile_views",
-                           "accounts_engaged", "total_interactions")
+DEFAULT_ACCOUNT_METRICS = (
+    "reach",
+    "follower_count",
+    "views",
+    "profile_views",
+    "accounts_engaged",
+    "total_interactions",
+)
 
 DEFAULT_AUDIENCE_METRIC = "follower_demographics"
 AUDIENCE_BREAKDOWNS = ("age", "gender", "country", "city")
