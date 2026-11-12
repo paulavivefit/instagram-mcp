@@ -1710,11 +1710,20 @@ def list_conversations(
         int | str, Field(description='How many conversations, newest first: 1-200 or "all" (default 5).')
     ] = 5,
     after: AfterArg = None,
+    user_id: Annotated[
+        str | None,
+        Field(
+            description="Fetch only the conversation with this person (their Instagram-scoped id, "
+            "e.g. from.id in get_messages). Fast; avoids scanning the inbox."
+        ),
+    ] = None,
 ) -> dict[str, Any]:
     """List Instagram DM conversations (newest first) with participant usernames.
+
     REQUIRES Meta App Review (instagram_manage_messages). limit 1-200 or "all" (default 5).
     Fetched one conversation per request: Meta rejects larger pages with
-    'Please reduce the amount of data you're asking for'."""
+    'Please reduce the amount of data you're asking for'. Pass user_id to get the
+    conversation with one specific person directly."""
 
     def _impl() -> dict[str, Any]:
         _require_dm()
@@ -1724,12 +1733,14 @@ def list_conversations(
         from instagram_mcp import graph_client as _gc
 
         items: list = []
+        uid = V.validate_graph_id(user_id, field="user_id") if user_id else None
         page = pclient.get(
             f"{page_id}/conversations",
             platform="instagram",
             fields="id,updated_time",
             limit=1,
             after=V.validate_cursor(after),
+            user_id=uid,
         )
         note = None
         nxt: str | None = None
@@ -1805,6 +1816,21 @@ OUTSIDE_WINDOW_HINT = (
     'Up to 7 days, a human-written reply can be sent with tag="HUMAN_AGENT" '
     "(requires the human_agent permission from Meta App Review)."
 )
+
+
+DEV_MODE_RECIPIENT_HINT = (
+    "Until Meta approves instagram_manage_messages (App Review / Advanced Access), the app can only "
+    "message people who have a role on it. Check the person is an accepted Tester in "
+    "developers.facebook.com -> App roles, and that their Instagram is linked to that Facebook account "
+    "in Accounts Center."
+)
+
+
+def _dm_permission_hint(exc: Exception) -> Exception:
+    """Attach the development-mode hint to a (#200) permission error from a DM send."""
+    if isinstance(exc, graph_client.GraphAPIError) and exc.code == 200 and not exc.extra.get("hint"):
+        exc.extra = {**exc.extra, "hint": DEV_MODE_RECIPIENT_HINT}
+    return exc
 
 
 def _is_outside_window(exc: graph_client.GraphAPIError) -> bool:
@@ -1883,7 +1909,7 @@ def send_message(
                         extra={"hint": OUTSIDE_WINDOW_HINT, **sent},
                     ) from exc
                 if not results:
-                    raise
+                    raise _dm_permission_hint(exc) from None
                 raise graph_client.GraphAPIError(
                     audit.sanitize_error(str(exc)),
                     error_class=audit.classify_error(exc),
@@ -1945,7 +1971,10 @@ def mark_seen(
         rid = V.validate_graph_id(recipient_id, field="recipient_id")
         act = V.validate_enum(action, set(SENDER_ACTIONS), field="action", default="mark_seen")
         pclient, page_id = _page_dm_client(client, acct)
-        res = pclient.post(f"{page_id}/messages", recipient=json.dumps({"id": rid}), sender_action=act)
+        try:
+            res = pclient.post(f"{page_id}/messages", recipient=json.dumps({"id": rid}), sender_action=act)
+        except graph_client.GraphAPIError as exc:
+            raise _dm_permission_hint(exc) from None
         return {"ok": True, "account": acct.label, "recipient_id": rid, "action": act, "result": res}
 
     return _guard("mark_seen", {"recipient_id": recipient_id, "action": action, "account": account}, _impl)

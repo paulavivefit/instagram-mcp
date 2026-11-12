@@ -144,6 +144,10 @@ def _map_graph_error(payload: dict[str, Any], http_status: int) -> GraphAPIError
     if code == 100:
         # 100 is "invalid parameter" UNLESS it's the missing-permission subcode family.
         error_class = "invalid_param"
+    if subcode == 2534084 or (code == -2 and str(message).strip().lower() == "timeout"):
+        # Development mode: Meta must skip conversations with people who have no app role,
+        # and a large inbox makes that query time out. Not a token problem.
+        error_class = "dev_mode_limit"
     if code == 110:
         # "Invalid user id": a bad username in user_tags/collaborators, not a login problem
         error_class = "invalid_param"
@@ -165,6 +169,10 @@ def _map_graph_error(payload: dict[str, Any], http_status: int) -> GraphAPIError
 ERROR_HINTS_BY_SUBCODE = {
     2207018: "Instagram could not find that user. People in user_tags and collaborators must be existing "
     "PUBLIC Instagram accounts (private accounts cannot be tagged via the API); check the spelling.",
+    2534084: "Meta timed out listing conversations: in development mode it has to skip every "
+    "conversation with people who have no role on the app, and this inbox is too large. "
+    "Pass user_id (the person's Instagram-scoped id) to list_conversations to fetch one "
+    "conversation directly, or wait for App Review approval (Live mode), which removes the limit.",
     2207019: "location_id must be the id of a Facebook Page that has a physical address set (a place). "
     "Pages without an address are rejected.",
     2207067: "Meta rejected a parameter for this media type (for example media_type=VIDEO for feed posts, "
