@@ -1,4 +1,4 @@
-"""instagram-mcp v0.2.0 — official Instagram Graph API MCP.
+"""instagram-mcp v0.2.1 — official Instagram Graph API MCP.
 
 A self-contained, multi-account wrapper over the OFFICIAL Instagram Graph API
 (graph.facebook.com). Read, publish, comment, and pull analytics for any
@@ -197,6 +197,27 @@ def _require_dm() -> None:
         )
 
 
+VIDEO_UPLOAD_HINT = (
+    "Instagram could not download or process the media. Use a direct public https link to the file "
+    "(MP4 with H.264 video and AAC audio for videos). Links copied from Instagram's own CDN "
+    "(cdninstagram.com / fbcdn.net) are rejected; upload the file to your own website or storage instead."
+)
+
+
+def _processing_error(container_id: str, status: dict[str, Any]) -> graph_client.GraphAPIError:
+    detail = str(status.get("status") or "")
+    hint = (
+        VIDEO_UPLOAD_HINT
+        if ("2207076" in detail or "upload has failed" in detail.lower())
+        else ("Instagram could not process this media; check it meets Instagram's format and size requirements.")
+    )
+    return graph_client.GraphAPIError(
+        f"media container {container_id} processing failed: {detail}",
+        error_class="upstream_error",
+        extra={"container_id": container_id, "hint": hint},
+    )
+
+
 VIDEO_WAIT_S = int(os.environ.get("INSTAGRAM_MCP_VIDEO_WAIT_S", "300"))
 PUBLISH_LATER_HINT = (
     "Instagram is still processing the video. Nothing was published yet. "
@@ -220,10 +241,7 @@ def _wait_container_ready(
         if code == "FINISHED":
             return
         if code == "ERROR":
-            raise graph_client.GraphAPIError(
-                f"media container {container_id} processing failed: {status.get('status')}",
-                error_class="upstream_error",
-            )
+            raise _processing_error(container_id, status)
         if time.monotonic() + interval_s > deadline:
             raise graph_client.GraphAPIError(
                 f"media container {container_id} not ready after {wait}s",
@@ -1088,9 +1106,7 @@ def publish_container(
         if code == "FINISHED":
             return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid)}
         if code == "ERROR":
-            raise graph_client.GraphAPIError(
-                f"media container {cid} processing failed: {status.get('status')}", error_class="upstream_error"
-            )
+            raise _processing_error(cid, status)
         return {
             "ok": False,
             "account": acct.label,
@@ -1163,8 +1179,10 @@ def publish_video(
     account: AccountArg = None,
     prepare_only: PrepareOnlyArg = False,
 ) -> dict[str, Any]:
-    """Publish a video post to the feed (publicly visible; the API cannot delete posts).
+    """Publish a video to the feed (publicly visible; the API cannot delete posts).
 
+    Meta no longer accepts plain feed videos, so it is published as a reel that is also
+    shown in the profile grid (same as publish_reel with share_to_feed=true).
     Instagram downloads the video from video_url and processes it; this waits up to
     INSTAGRAM_MCP_VIDEO_WAIT_S (default 300 s). On timeout nothing is published and the
     result has container_id: finish later with publish_container.
@@ -1172,9 +1190,11 @@ def publish_video(
 
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
-        url = V.validate_public_https_url(video_url, field="video_url")
+        url = V.validate_video_url(video_url, field="video_url")
         cap = V.validate_caption(caption)
-        container = client.post(f"{acct.ig_user_id}/media", media_type="VIDEO", video_url=url, caption=cap)
+        container = client.post(
+            f"{acct.ig_user_id}/media", media_type="REELS", share_to_feed=True, video_url=url, caption=cap
+        )
         cid = container.get("id")
         _wait_container_ready(client, cid)
         return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid, prepare_only=prepare_only)}
@@ -1219,7 +1239,7 @@ def publish_reel(
 
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
-        url = V.validate_public_https_url(video_url, field="video_url")
+        url = V.validate_video_url(video_url, field="video_url")
         cover = V.validate_public_https_url(cover_url, field="cover_url") if cover_url else None
         if thumb_offset is not None and (
             isinstance(thumb_offset, bool) or not isinstance(thumb_offset, int) or thumb_offset < 0
@@ -1289,7 +1309,12 @@ def publish_carousel(
         client, acct = auth.client_for(account)
         if not isinstance(image_urls, list) or not (2 <= len(image_urls) <= CAROUSEL_MAX):
             raise V.ValidationError(f"image_urls must be a list of 2-{CAROUSEL_MAX} public https URLs")
-        urls = [V.validate_public_https_url(u, field="image_url") for u in image_urls]
+        urls = [
+            V.validate_video_url(u, field="image_urls item")
+            if _is_video_url(u)
+            else V.validate_public_https_url(u, field="image_url")
+            for u in image_urls
+        ]
         cap = V.validate_caption(caption)
         collab = V.validate_collaborators(collaborators)
         loc = V.validate_location_id(location_id)
@@ -1364,7 +1389,7 @@ def publish_story(
             container = client.post(f"{acct.ig_user_id}/media", media_type="STORIES", image_url=url)
             cid = container.get("id")
         else:
-            url = V.validate_public_https_url(video_url, field="video_url")
+            url = V.validate_video_url(video_url, field="video_url")
             container = client.post(f"{acct.ig_user_id}/media", media_type="STORIES", video_url=url)
             cid = container.get("id")
             _wait_container_ready(client, cid)

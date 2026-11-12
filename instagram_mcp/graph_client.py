@@ -144,6 +144,9 @@ def _map_graph_error(payload: dict[str, Any], http_status: int) -> GraphAPIError
     if code == 100:
         # 100 is "invalid parameter" UNLESS it's the missing-permission subcode family.
         error_class = "invalid_param"
+    if code == 110:
+        # "Invalid user id": a bad username in user_tags/collaborators, not a login problem
+        error_class = "invalid_param"
     if http_status == 404:
         error_class = "not_found"
 
@@ -155,7 +158,31 @@ def _map_graph_error(payload: dict[str, Any], http_status: int) -> GraphAPIError
         type_=etype if isinstance(etype, str) else None,
         http_status=http_status,
         transient=bool(err.get("is_transient")),
+        extra=_error_hint(subcode if isinstance(subcode, int) else None, message),
     )
+
+
+ERROR_HINTS_BY_SUBCODE = {
+    2207018: "Instagram could not find that user. People in user_tags and collaborators must be existing "
+    "PUBLIC Instagram accounts (private accounts cannot be tagged via the API); check the spelling.",
+    2207019: "location_id must be the id of a Facebook Page that has a physical address set (a place). "
+    "Pages without an address are rejected.",
+    2207067: "Meta rejected a parameter for this media type (for example media_type=VIDEO for feed posts, "
+    "which Meta no longer accepts; videos are published as reels).",
+}
+PUBLIC_CONTENT_HINT = (
+    "This endpoint needs Meta's 'Instagram Public Content Access' feature, which must be "
+    "requested in App Review (developers.facebook.com -> your app -> App Review -> "
+    "Permissions and Features). Until it is approved, hashtag search cannot be used."
+)
+
+
+def _error_hint(subcode: int | None, message: Any) -> dict[str, Any] | None:
+    if subcode in ERROR_HINTS_BY_SUBCODE:
+        return {"hint": ERROR_HINTS_BY_SUBCODE[subcode]}
+    if isinstance(message, str) and "Instagram Public Content Access" in message:
+        return {"hint": PUBLIC_CONTENT_HINT}
+    return None
 
 
 def _backoff(attempt: int) -> float:
@@ -179,6 +206,7 @@ def _pct_max(values: Any) -> float:
 def _record_usage(headers: Any) -> None:
     """Remember Meta's rate-limit usage headers (percent of the hourly quota)."""
     import json
+
     if headers is None:
         return
     app_raw = headers.get("X-App-Usage")
@@ -278,16 +306,16 @@ class GraphClient:
             attempt += 1
             can_retry = attempt < (self._max_attempts or MAX_ATTEMPTS)
             try:
-                with httpx.Client(timeout=self._timeout,
-                                  transport=self._transport or DEFAULT_TRANSPORT) as client:
+                with httpx.Client(timeout=self._timeout, transport=self._transport or DEFAULT_TRANSPORT) as client:
                     resp = client.request(method, url, params=query, data=data)
             except httpx.TimeoutException as exc:
                 # A timed-out POST may have been processed (published/sent): never repeat it.
                 if method == "GET" and can_retry:
                     _sleep(_backoff(attempt))
                     continue
-                raise GraphAPIError(f"Graph API request timed out after {self._timeout}s",
-                                    error_class="timeout") from exc
+                raise GraphAPIError(
+                    f"Graph API request timed out after {self._timeout}s", error_class="timeout"
+                ) from exc
             except httpx.HTTPError as exc:
                 # A connect error means nothing was sent, so any method is safe to retry.
                 if can_retry and (method == "GET" or isinstance(exc, httpx.ConnectError)):

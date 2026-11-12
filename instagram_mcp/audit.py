@@ -28,8 +28,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-AUDIT_PATH = Path(os.environ.get("INSTAGRAM_MCP_AUDIT_PATH") or
-                  os.path.expanduser("~/.claude/instagram-mcp/audit.log.jsonl"))
+AUDIT_PATH = Path(
+    os.environ.get("INSTAGRAM_MCP_AUDIT_PATH") or os.path.expanduser("~/.claude/instagram-mcp/audit.log.jsonl")
+)
 
 # Patterns scrubbed from any string before it crosses the seam.
 # Ordered most-specific -> least-specific so longer prefixes shadow shorter ones.
@@ -125,8 +126,12 @@ def record(
         "tool": tool,
         "execution_time_ms": int(execution_time_ms),
         "io": sanitize_payload(io),
-        "token_usage": token_usage or {
-            "prompt": 0, "completion": 0, "cache_read": 0, "cache_creation": 0,
+        "token_usage": token_usage
+        or {
+            "prompt": 0,
+            "completion": 0,
+            "cache_read": 0,
+            "cache_creation": 0,
         },
         "error_class": error_class,
     }

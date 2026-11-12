@@ -75,6 +75,10 @@ Or skip the env vars and call `add_account` at runtime (token goes to your OS ke
 
 **Reliability** — automatic retries with backoff for slow or rate-limited Meta responses (a timed-out publish or send is never repeated), 60 s request timeout, 5 min video processing wait. Knobs: `INSTAGRAM_MCP_TIMEOUT`, `INSTAGRAM_MCP_MAX_ATTEMPTS`, `INSTAGRAM_MCP_VIDEO_WAIT_S`, `INSTAGRAM_MCP_GRAPH_VERSION` (default `v27.0`).
 
+**Review before posting** — every `publish_*` tool takes `prepare_only=true`: Instagram downloads and processes the post (and validates tags, collaborators, location) but nothing is published; call `publish_container(container_id)` within ~24 h to publish it.
+
+**Known Meta limits (verified live)** — plain feed videos are no longer accepted, so `publish_video` publishes a reel shown in the grid; video links from Instagram's own CDN (cdninstagram.com / fbcdn.net) are rejected as sources; tagged users and collaborators must be public accounts; `location_id` must be a Facebook Page with an address; hashtag search needs Meta's *Instagram Public Content Access* feature (App Review). The API cannot delete posts.
+
 > Publishing takes **public https media URLs** — Instagram fetches the bytes itself, so the image/video must be reachable on the open web (an S3/Cloudflare/any-CDN URL works).
 
 ## Multiple accounts
