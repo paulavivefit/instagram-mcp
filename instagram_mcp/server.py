@@ -37,9 +37,10 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
+from pydantic import Field
 
 from instagram_mcp import audit, auth, graph_client
 from instagram_mcp import insights_metrics as IM
@@ -47,11 +48,55 @@ from instagram_mcp import validators as V
 
 mcp = FastMCP("instagram-mcp")
 
+# Shared parameter types: one description per concept, reused by every tool.
+AccountArg = Annotated[
+    str | None,
+    Field(description="Which configured account to use (a label from list_accounts). Omit to use the default account."),
+]
+AfterArg = Annotated[
+    str | None,
+    Field(
+        description="Paging cursor: pass next_cursor from a previous result to continue where it stopped. Omit to start from the newest."
+    ),
+]
+MediaIdArg = Annotated[
+    str,
+    Field(description="Id of a post, reel or story (the `id` field from list_media, get_mentions or list_stories)."),
+]
+CommentIdArg = Annotated[
+    str, Field(description="Id of a comment (the `id` field from get_comments or get_comment_replies).")
+]
+RecipientIdArg = Annotated[
+    str,
+    Field(
+        description="Customer's Instagram-scoped id: participant `id` from list_conversations or `from.id` from get_messages."
+    ),
+]
+ConversationIdArg = Annotated[
+    str, Field(description="Conversation id from list_conversations (a long base64-like string).")
+]
+CaptionArg = Annotated[
+    str | None, Field(description="Post caption: up to 2200 characters, 30 hashtags and 20 @mentions. Optional.")
+]
+CollaboratorsArg = Annotated[
+    list[str] | None,
+    Field(
+        description="Up to 3 Instagram usernames invited as collaborators (the post appears on their profile once they accept)."
+    ),
+]
+LocationIdArg = Annotated[
+    str | int | None, Field(description="Facebook location Page id to show as the post location (numeric). Optional.")
+]
+LabelArg = Annotated[
+    str, Field(description='Short name for the account, e.g. "vivefit" or "client-a" (letters, digits, - and _).')
+]
+
 # ----------------------------- field selections ----------------------------- #
-PROFILE_FIELDS = ("id,username,name,biography,followers_count,follows_count,"
-                  "media_count,profile_picture_url,website")
-MEDIA_FIELDS = ("id,caption,media_type,media_product_type,media_url,permalink,"
-                "thumbnail_url,timestamp,username,like_count,comments_count")
+PROFILE_FIELDS = "id,username,name,biography,followers_count,follows_count,media_count,profile_picture_url,website"
+MEDIA_FIELDS = (
+    "id,caption,media_type,media_product_type,media_url,permalink,"
+    "thumbnail_url,timestamp,username,like_count,comments_count"
+)
 COMMENT_FIELDS = "id,text,username,timestamp,like_count,hidden"
 COMMENT_WITH_REPLIES_FIELDS = COMMENT_FIELDS + ",replies{" + COMMENT_FIELDS + "}"
 CHILD_FIELDS = "children{id,media_type,media_url,thumbnail_url,permalink,timestamp}"
@@ -61,6 +106,7 @@ STORY_FIELDS = "id,media_type,media_product_type,media_url,thumbnail_url,permali
 
 
 # --------------------------------- plumbing --------------------------------- #
+
 
 def _ms(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
@@ -88,15 +134,17 @@ def _guard(tool: str, input_payload: dict[str, Any], impl: Any) -> dict[str, Any
     safe_in = audit.sanitize_payload(input_payload)
     try:
         result = impl()
-        audit.record(tool, execution_time_ms=_ms(start),
-                     io={"input": safe_in, "output": _summarize(result)})
+        audit.record(tool, execution_time_ms=_ms(start), io={"input": safe_in, "output": _summarize(result)})
         return result
     except Exception as exc:  # noqa: BLE001 — boundary: classify + sanitize, never re-raise raw
         error_class = audit.classify_error(exc)
         message = audit.sanitize_error(str(exc))
-        audit.record(tool, execution_time_ms=_ms(start),
-                     io={"input": safe_in, "output": {"error": message}},
-                     error_class=error_class)
+        audit.record(
+            tool,
+            execution_time_ms=_ms(start),
+            io={"input": safe_in, "output": {"error": message}},
+            error_class=error_class,
+        )
         if error_class == "oauth":
             _PAGE_CACHE.clear()  # a revoked/expired token must not stay cached
         out = {"ok": False, "error": message, "error_class": error_class}
@@ -112,7 +160,13 @@ def _account_summary(acct: auth.ResolvedAccount) -> dict[str, Any]:
 
 # Per-tool ceilings for limit="all" (keeps one call inside Meta's ~200 calls/hour budget).
 CEIL_MEDIA, CEIL_COMMENTS, CEIL_DISCOVERY, CEIL_TAGS, CEIL_CONVERSATIONS, CEIL_MESSAGES = (
-    10000, 5000, 500, 1000, 200, 100)
+    10000,
+    5000,
+    500,
+    1000,
+    200,
+    100,
+)
 
 
 def _paged(out: dict[str, Any], items: list[dict[str, Any]], cursor: str | None, key: str) -> dict[str, Any]:
@@ -137,12 +191,15 @@ def _require_dm() -> None:
 
 
 VIDEO_WAIT_S = int(os.environ.get("INSTAGRAM_MCP_VIDEO_WAIT_S", "300"))
-PUBLISH_LATER_HINT = ("Instagram is still processing the video. Nothing was published yet. "
-                      "Call publish_container(container_id) in a few minutes to finish without re-uploading.")
+PUBLISH_LATER_HINT = (
+    "Instagram is still processing the video. Nothing was published yet. "
+    "Call publish_container(container_id) in a few minutes to finish without re-uploading."
+)
 
 
-def _wait_container_ready(client: graph_client.GraphClient, container_id: str,
-                          *, timeout_s: int | None = None, interval_s: int = 5) -> None:
+def _wait_container_ready(
+    client: graph_client.GraphClient, container_id: str, *, timeout_s: int | None = None, interval_s: int = 5
+) -> None:
     """Poll a media container until status_code=FINISHED (video/reel/story-video are async).
 
     On timeout raises a GraphAPIError(error_class=timeout) carrying container_id + a hint,
@@ -158,18 +215,23 @@ def _wait_container_ready(client: graph_client.GraphClient, container_id: str,
         if code == "ERROR":
             raise graph_client.GraphAPIError(
                 f"media container {container_id} processing failed: {status.get('status')}",
-                error_class="upstream_error")
+                error_class="upstream_error",
+            )
         if time.monotonic() + interval_s > deadline:
             raise graph_client.GraphAPIError(
-                f"media container {container_id} not ready after {wait}s", error_class="timeout",
-                extra={"container_id": container_id, "status_code": code, "hint": PUBLISH_LATER_HINT})
+                f"media container {container_id} not ready after {wait}s",
+                error_class="timeout",
+                extra={"container_id": container_id, "status_code": code, "hint": PUBLISH_LATER_HINT},
+            )
         time.sleep(interval_s)
 
 
-PUBLISH_UNCERTAIN_HINT = ("The publish request failed or timed out, so the post MAY already be live. "
-                          "Check list_media (newest first) before doing anything else. If it is not "
-                          "there, call publish_container(container_id); do not call publish_* again "
-                          "(that would upload a second copy).")
+PUBLISH_UNCERTAIN_HINT = (
+    "The publish request failed or timed out, so the post MAY already be live. "
+    "Check list_media (newest first) before doing anything else. If it is not "
+    "there, call publish_container(container_id); do not call publish_* again "
+    "(that would upload a second copy)."
+)
 
 
 def _publish_container(client: graph_client.GraphClient, ig_user_id: str, container_id: str) -> dict[str, Any]:
@@ -177,24 +239,36 @@ def _publish_container(client: graph_client.GraphClient, ig_user_id: str, contai
         published = client.post(f"{ig_user_id}/media_publish", creation_id=container_id)
     except graph_client.GraphAPIError as exc:
         uncertain = exc.error_class in {"timeout", "network"} or (exc.http_status or 0) >= 500
-        hint = PUBLISH_UNCERTAIN_HINT if uncertain else (
-            "Meta rejected the publish; nothing was posted. Fix the cause, then call "
-            "publish_container(container_id) to retry without re-uploading.")
-        raise graph_client.GraphAPIError(str(exc), error_class=exc.error_class, code=exc.code,
-                                         subcode=exc.subcode, http_status=exc.http_status,
-                                         extra={"container_id": container_id, "hint": hint}) from exc
+        hint = (
+            PUBLISH_UNCERTAIN_HINT
+            if uncertain
+            else (
+                "Meta rejected the publish; nothing was posted. Fix the cause, then call "
+                "publish_container(container_id) to retry without re-uploading."
+            )
+        )
+        raise graph_client.GraphAPIError(
+            str(exc),
+            error_class=exc.error_class,
+            code=exc.code,
+            subcode=exc.subcode,
+            http_status=exc.http_status,
+            extra={"container_id": container_id, "hint": hint},
+        ) from exc
     return {"ok": True, "media_id": published.get("id"), "container_id": container_id}
 
 
 # ============================ HEALTH + ACCOUNTS ============================ #
 
-@mcp.tool()
+
+@mcp.tool(annotations={"title": "Check Instagram connection", "readOnlyHint": True, "openWorldHint": True})
 def healthcheck() -> dict[str, Any]:
-    """Verify the MCP is configured + ready: accounts present, token backend, Graph reachability.
+    """Check the setup works: accounts, token storage, live Graph API call, rate-limit usage.
 
     Does a live GET on the default account's profile if one is configured. Safe to
     call anytime; never mutates. Returns ok=false with a hint when no account is set.
     """
+
     def _impl() -> dict[str, Any]:
         accounts = auth.list_accounts()
         out: dict[str, Any] = {
@@ -208,8 +282,10 @@ def healthcheck() -> dict[str, Any]:
         }
         if not accounts:
             out["ok"] = False
-            out["hint"] = ("No account configured. Set INSTAGRAM_MCP_ACCESS_TOKEN + "
-                           "INSTAGRAM_MCP_IG_USER_ID, or call add_account(label, access_token, ig_user_id).")
+            out["hint"] = (
+                "No account configured. Set INSTAGRAM_MCP_ACCESS_TOKEN + "
+                "INSTAGRAM_MCP_IG_USER_ID, or call add_account(label, access_token, ig_user_id)."
+            )
             return out
         try:
             client, acct = auth.client_for(None)
@@ -218,39 +294,65 @@ def healthcheck() -> dict[str, Any]:
             if graph_client.LAST_USAGE:
                 usage = dict(graph_client.LAST_USAGE)
                 if usage.get("max_percent", 0) >= 80:
-                    usage["warning"] = ("Meta rate limit nearly reached; heavy calls (limit=\"all\") "
-                                        "may be throttled for up to an hour.")
+                    usage["warning"] = (
+                        'Meta rate limit nearly reached; heavy calls (limit="all") may be throttled for up to an hour.'
+                    )
                 out["api_usage"] = usage
         except Exception as exc:  # noqa: BLE001
             out["ok"] = False
-            out["live_check"] = {"ok": False, "error": audit.sanitize_error(str(exc)),
-                                 "error_class": audit.classify_error(exc)}
+            out["live_check"] = {
+                "ok": False,
+                "error": audit.sanitize_error(str(exc)),
+                "error_class": audit.classify_error(exc),
+            }
         return out
 
     return _guard("healthcheck", {}, _impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"title": "List configured accounts", "readOnlyHint": True, "openWorldHint": True})
 def list_accounts() -> dict[str, Any]:
     """List configured Instagram accounts (labels + ig_user_id + default flag). Never returns tokens."""
-    return _guard("list_accounts", {}, lambda: {"ok": True, "accounts": auth.list_accounts(),
-                                                 "count": len(auth.list_accounts())})
+    return _guard(
+        "list_accounts", {}, lambda: {"ok": True, "accounts": auth.list_accounts(), "count": len(auth.list_accounts())}
+    )
 
 
-@mcp.tool()
-def add_account(label: str, access_token: str, ig_user_id: str,
-                *, app_secret: str | None = None, make_default: bool = False) -> dict[str, Any]:
-    """Store an Instagram Business/Creator account for use by every tool.
+@mcp.tool(
+    annotations={
+        "title": "Add Instagram account",
+        "readOnlyHint": False,
+        "openWorldHint": False,
+        "destructiveHint": False,
+    }
+)
+def add_account(
+    label: LabelArg,
+    access_token: Annotated[
+        str,
+        Field(
+            description="Long-lived Instagram Graph API access token (EAA...). Stored in the OS keychain, never returned."
+        ),
+    ],
+    ig_user_id: Annotated[
+        str,
+        Field(
+            description="Numeric Instagram Business Account id (instagram_business_account.id of the linked Facebook Page)."
+        ),
+    ],
+    *,
+    app_secret: Annotated[
+        str | None,
+        Field(description="Optional Meta app secret; enables appsecret_proof on every call for extra security."),
+    ] = None,
+    make_default: Annotated[bool, Field(description="True to use this account whenever `account` is omitted.")] = False,
+) -> dict[str, Any]:
+    """Store an Instagram Business/Creator account (label + token) for use by every tool.
 
-    label        a short key you choose (e.g. "onde", "mycelium", "client-acme")
-    access_token a long-lived Instagram Graph API token (stored in the OS keychain)
-    ig_user_id   the Instagram Business Account id (numeric)
-    app_secret   optional Meta app secret — enables appsecret_proof call hardening
-    make_default set true to make this the account used when `account` is omitted
-
-    The token is written to the macOS keychain (or a chmod-600 file fallback) and
-    is NEVER echoed back or logged.
+    The token is written to the OS keychain (macOS) or a chmod-600 file, and is never
+    returned or logged. Only changes local configuration; nothing is posted to Instagram.
     """
+
     def _impl() -> dict[str, Any]:
         lbl = V.validate_account_label(label)
         uid = V.validate_ig_user_id(ig_user_id)
@@ -260,56 +362,98 @@ def add_account(label: str, access_token: str, ig_user_id: str,
         return {"ok": True, **info}
 
     # Redact the token from the audit input — never persist it to the log.
-    redacted = {"label": label, "access_token": "***", "token_len": len(access_token or ""),
-                "ig_user_id": ig_user_id, "app_secret": "***" if app_secret else None,
-                "make_default": make_default}
+    redacted = {
+        "label": label,
+        "access_token": "***",
+        "token_len": len(access_token or ""),
+        "ig_user_id": ig_user_id,
+        "app_secret": "***" if app_secret else None,
+        "make_default": make_default,
+    }
     return _guard("add_account", redacted, _impl)
 
 
-@mcp.tool()
-def set_default_account(label: str) -> dict[str, Any]:
+@mcp.tool(
+    annotations={
+        "title": "Set default account",
+        "readOnlyHint": False,
+        "openWorldHint": False,
+        "destructiveHint": False,
+    }
+)
+def set_default_account(label: LabelArg) -> dict[str, Any]:
     """Set which configured account is used when a tool's `account` arg is omitted."""
-    return _guard("set_default_account", {"label": label},
-                  lambda: {"ok": True, **auth.set_default(V.validate_account_label(label))})
+    return _guard(
+        "set_default_account",
+        {"label": label},
+        lambda: {"ok": True, **auth.set_default(V.validate_account_label(label))},
+    )
 
 
-@mcp.tool()
-def remove_account(label: str) -> dict[str, Any]:
+@mcp.tool(
+    annotations={
+        "title": "Remove account and token",
+        "readOnlyHint": False,
+        "openWorldHint": True,
+        "destructiveHint": True,
+    }
+)
+def remove_account(label: LabelArg) -> dict[str, Any]:
     """Remove a configured account + delete its stored token from the keychain."""
-    return _guard("remove_account", {"label": label},
-                  lambda: {"ok": True, **auth.remove_account(V.validate_account_label(label))})
+    return _guard(
+        "remove_account", {"label": label}, lambda: {"ok": True, **auth.remove_account(V.validate_account_label(label))}
+    )
 
 
-@mcp.tool()
-def account_info(account: str | None = None) -> dict[str, Any]:
+@mcp.tool(annotations={"title": "Account snapshot", "readOnlyHint": True, "openWorldHint": True})
+def account_info(account: AccountArg = None) -> dict[str, Any]:
     """Live profile snapshot for one account: username, name, followers, media count, etc."""
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         prof = client.get(acct.ig_user_id, fields=PROFILE_FIELDS)
         return {"ok": True, "account": acct.label, "profile": prof}
+
     return _guard("account_info", {"account": account}, _impl)
 
 
 # ============================ PROFILE + MEDIA ============================ #
 
-@mcp.tool()
-def get_profile(account: str | None = None) -> dict[str, Any]:
+
+@mcp.tool(annotations={"title": "Get profile", "readOnlyHint": True, "openWorldHint": True})
+def get_profile(account: AccountArg = None) -> dict[str, Any]:
     """Return the account's public profile fields (followers, follows, media count, bio, website)."""
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         return {"ok": True, "account": acct.label, "profile": client.get(acct.ig_user_id, fields=PROFILE_FIELDS)}
+
     return _guard("get_profile", {"account": account}, _impl)
 
 
-@mcp.tool()
-def list_media(account: str | None = None, *, limit: int | str = 25, after: str | None = None,
-               since: str | None = None, until: str | None = None) -> dict[str, Any]:
+@mcp.tool(annotations={"title": "List posts", "readOnlyHint": True, "openWorldHint": True})
+def list_media(
+    account: AccountArg = None,
+    *,
+    limit: Annotated[
+        int | str, Field(description='How many posts to return: 1-10000 or "all" (default 25). Newest first.')
+    ] = 25,
+    after: AfterArg = None,
+    since: Annotated[
+        str | None,
+        Field(description='Only posts on or after this date, e.g. "2026-10-01" (ISO date or datetime). Optional.'),
+    ] = None,
+    until: Annotated[
+        str | None, Field(description='Only posts on or before this date, e.g. "2026-10-31" (inclusive). Optional.')
+    ] = None,
+) -> dict[str, Any]:
     """List the account's posts/reels, newest first.
 
     limit: 1-10000 or "all" (default 25). since/until: dates like 2026-10-01 (inclusive)
     to keep only posts in that range. When more posts exist the result has
     next_cursor; pass it back as `after` to continue.
     """
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         lim = V.validate_limit(limit, ceiling=CEIL_MEDIA, all_ceiling=CEIL_MEDIA)
@@ -327,11 +471,17 @@ def list_media(account: str | None = None, *, limit: int | str = 25, after: str 
             ts = item.get("timestamp")
             return bool(end_dt and ts and V.parse_graph_time(ts) > end_dt)
 
-        items, cursor = client.paginate(f"{acct.ig_user_id}/media", fields=MEDIA_FIELDS,
-                                        max_items=lim, after=cur, stop=too_old if start_dt else None,
-                                        skip=too_new if end_dt else None)
+        items, cursor = client.paginate(
+            f"{acct.ig_user_id}/media",
+            fields=MEDIA_FIELDS,
+            max_items=lim,
+            after=cur,
+            stop=too_old if start_dt else None,
+            skip=too_new if end_dt else None,
+        )
         if getattr(client, "last_cut", False) and items:
             from datetime import timedelta
+
             last = V.parse_graph_time(items[-1]["timestamp"])
             out = _paged({"ok": True, "account": acct.label}, items, None, "media")
             out["truncated"] = True
@@ -340,37 +490,42 @@ def list_media(account: str | None = None, *, limit: int | str = 25, after: str 
             out["hint"] = f"More posts exist. To continue, call list_media again with until={nxt_until!r}."
             return out
         return _paged({"ok": True, "account": acct.label}, items, cursor, "media")
+
     return _guard("list_media", {"account": account, "limit": limit, "since": since, "until": until}, _impl)
 
 
-@mcp.tool()
-def get_media(media_id: str, account: str | None = None) -> dict[str, Any]:
+@mcp.tool(annotations={"title": "Get post details", "readOnlyHint": True, "openWorldHint": True})
+def get_media(media_id: MediaIdArg, account: AccountArg = None) -> dict[str, Any]:
     """Full fields for one post (caption, type, permalink, like/comment counts).
 
     Carousels also return `children` (each image/video with its own media_url).
     """
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         mid = V.validate_graph_id(media_id, field="media_id")
-        return {"ok": True, "account": acct.label,
-                "media": client.get(mid, fields=MEDIA_FIELDS + "," + CHILD_FIELDS)}
+        return {"ok": True, "account": acct.label, "media": client.get(mid, fields=MEDIA_FIELDS + "," + CHILD_FIELDS)}
+
     return _guard("get_media", {"media_id": media_id, "account": account}, _impl)
 
 
 # ================================ INSIGHTS ================================ #
 
+
 def _utcnow():
     from datetime import datetime, timezone
+
     return datetime.now(timezone.utc)
 
 
-MAX_WINDOW_S = 30 * 86400          # Meta: at most 30 days between since and until
-MAX_HISTORY_DAYS = 730             # Meta keeps ~2 years of account insights
+MAX_WINDOW_S = 30 * 86400  # Meta: at most 30 days between since and until
+MAX_HISTORY_DAYS = 730  # Meta keeps ~2 years of account insights
 
 
 def _resolve_range(since: str | None, until: str | None):
     """-> (since_dt, until_dt) or (None, None). Date-only `until` is inclusive (next midnight)."""
     from datetime import timedelta
+
     if not since and not until:
         return None, None
     now = _utcnow()
@@ -388,6 +543,7 @@ def _resolve_range(since: str | None, until: str | None):
 
 def _windows(start, end):
     from datetime import timedelta
+
     out, cur = [], start
     while cur < end:
         nxt = min(cur + timedelta(seconds=MAX_WINDOW_S), end)
@@ -396,8 +552,9 @@ def _windows(start, end):
     return out
 
 
-def _account_insights_range(client, acct, ts: list[str], tv: list[str], start, end,
-                            period: str = "day") -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+def _account_insights_range(
+    client, acct, ts: list[str], tv: list[str], start, end, period: str = "day"
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     """Fetch account insights over [start, end): chunked into 30-day windows and merged.
 
     Time-series metrics get their daily values stitched in order; total_value metrics are
@@ -406,17 +563,25 @@ def _account_insights_range(client, acct, ts: list[str], tv: list[str], start, e
     available for the last 30 days, so it is clamped to that range.
     """
     from datetime import timedelta
+
     merged: dict[str, dict[str, Any]] = {}
     errors: list[dict[str, Any]] = []
     notes: list[str] = []
 
     def fetch(params, group, win):
         try:
-            return client.get(f"{acct.ig_user_id}/insights", since=int(win[0].timestamp()),
-                              until=int(win[1].timestamp()), **params).get("data", [])
+            return client.get(
+                f"{acct.ig_user_id}/insights", since=int(win[0].timestamp()), until=int(win[1].timestamp()), **params
+            ).get("data", [])
         except graph_client.GraphAPIError as exc:
-            errors.append({"metrics": group, "since": win[0].date().isoformat(),
-                           "error": audit.sanitize_error(str(exc)), "error_class": exc.error_class})
+            errors.append(
+                {
+                    "metrics": group,
+                    "since": win[0].date().isoformat(),
+                    "error": audit.sanitize_error(str(exc)),
+                    "error_class": exc.error_class,
+                }
+            )
             return []
 
     def add(rows, total: bool):
@@ -436,24 +601,43 @@ def _account_insights_range(client, acct, ts: list[str], tv: list[str], start, e
         if ts_main:
             add(fetch({"metric": ",".join(ts_main), "period": period}, ts_main, win), total=False)
         if tv:
-            add(fetch({"metric": ",".join(tv), "period": IM.TOTAL_VALUE_PERIOD,
-                       "metric_type": "total_value"}, tv, win), total=True)
+            add(
+                fetch({"metric": ",".join(tv), "period": IM.TOTAL_VALUE_PERIOD, "metric_type": "total_value"}, tv, win),
+                total=True,
+            )
     if "follower_count" in ts:
         today = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         f_start, f_end = max(start, today - timedelta(days=30)), min(end, today)
         if f_start < f_end:
-            add(fetch({"metric": "follower_count", "period": "day"}, ["follower_count"], (f_start, f_end)),
-                total=False)
+            add(fetch({"metric": "follower_count", "period": "day"}, ["follower_count"], (f_start, f_end)), total=False)
         if start < today - timedelta(days=30) or f_start >= f_end:
-            notes.append("follower_count is only available for the last 30 days (excluding today); "
-                         "older days were skipped.")
+            notes.append(
+                "follower_count is only available for the last 30 days (excluding today); older days were skipped."
+            )
     return list(merged.values()), errors, notes
 
 
-@mcp.tool()
-def get_account_insights(account: str | None = None, *, metrics: str | None = None,
-                         period: str = "day", since: str | None = None,
-                         until: str | None = None) -> dict[str, Any]:
+@mcp.tool(annotations={"title": "Account insights", "readOnlyHint": True, "openWorldHint": True})
+def get_account_insights(
+    account: AccountArg = None,
+    *,
+    metrics: Annotated[
+        str | None,
+        Field(
+            description='Comma-separated metric names to fetch instead of the defaults, e.g. "reach,views,follower_count".'
+        ),
+    ] = None,
+    period: Annotated[
+        Literal["day", "week", "days_28"],
+        Field(description="Bucket for daily-series metrics (reach, follower_count). Totals always use day."),
+    ] = "day",
+    since: Annotated[
+        str | None, Field(description='Start date, e.g. "2026-10-01". Up to about 2 years back. Optional.')
+    ] = None,
+    until: Annotated[
+        str | None, Field(description='End date (inclusive), e.g. "2026-10-31". Defaults to now. Optional.')
+    ] = None,
+) -> dict[str, Any]:
     """Account-level analytics, optionally over a date range.
 
     metrics: comma-separated Graph metric names. Default: reach, follower_count (daily
@@ -463,6 +647,7 @@ def get_account_insights(account: str | None = None, *, metrics: str | None = No
     stitched, totals summed (see `windows`). follower_count only covers the last 30 days.
     Without since/until Meta returns its default recent window.
     """
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         names = IM.parse_metric_list(metrics, IM.DEFAULT_ACCOUNT_METRICS)
@@ -478,14 +663,16 @@ def get_account_insights(account: str | None = None, *, metrics: str | None = No
             if ts:
                 groups.append(({"metric": ",".join(ts), "period": per}, ts))
             if tv:
-                groups.append(({"metric": ",".join(tv), "period": IM.TOTAL_VALUE_PERIOD,
-                                "metric_type": "total_value"}, tv))
+                groups.append(
+                    ({"metric": ",".join(tv), "period": IM.TOTAL_VALUE_PERIOD, "metric_type": "total_value"}, tv)
+                )
             for params, group in groups:
                 try:
                     insights.extend(client.get(f"{acct.ig_user_id}/insights", **params).get("data", []))
                 except graph_client.GraphAPIError as exc:
-                    errors.append({"metrics": group, "error": audit.sanitize_error(str(exc)),
-                                   "error_class": exc.error_class})
+                    errors.append(
+                        {"metrics": group, "error": audit.sanitize_error(str(exc)), "error_class": exc.error_class}
+                    )
         if not insights and errors:
             raise graph_client.GraphAPIError(errors[0]["error"], error_class=errors[0]["error_class"])
         out: dict[str, Any] = {"ok": True, "account": acct.label, "period": per, "insights": insights}
@@ -496,8 +683,12 @@ def get_account_insights(account: str | None = None, *, metrics: str | None = No
         if notes:
             out["note"] = " ".join(notes)
         return out
-    return _guard("get_account_insights", {"account": account, "metrics": metrics, "period": period,
-                                           "since": since, "until": until}, _impl)
+
+    return _guard(
+        "get_account_insights",
+        {"account": account, "metrics": metrics, "period": period, "since": since, "until": until},
+        _impl,
+    )
 
 
 SORT_METRICS = frozenset({"reach", "views", "likes", "comments", "shares", "saved", "total_interactions"})
@@ -518,11 +709,18 @@ def _batch_media_insights(client: graph_client.GraphClient, posts: list[dict[str
     Sets post["metrics"] = {name: value} on success; returns per-post errors.
     """
     import json
+
     errors: list[dict[str, Any]] = []
     for i in range(0, len(posts), 50):
-        chunk = posts[i:i + 50]
-        batch = [{"method": "GET", "relative_url": f"{p['id']}/insights?metric="
-                  + ",".join(IM.media_metrics_for(p.get("media_product_type")))} for p in chunk]
+        chunk = posts[i : i + 50]
+        batch = [
+            {
+                "method": "GET",
+                "relative_url": f"{p['id']}/insights?metric="
+                + ",".join(IM.media_metrics_for(p.get("media_product_type"))),
+            }
+            for p in chunk
+        ]
         replies = client.post("", batch=json.dumps(batch), include_headers="false").get("data") or []
         for post, reply in zip(chunk, replies, strict=False):
             try:
@@ -537,13 +735,20 @@ def _batch_media_insights(client: graph_client.GraphClient, posts: list[dict[str
     return errors
 
 
-@mcp.tool()
-def list_stories(account: str | None = None, *, include_insights: bool = False) -> dict[str, Any]:
+@mcp.tool(annotations={"title": "List active stories", "readOnlyHint": True, "openWorldHint": True})
+def list_stories(
+    account: AccountArg = None,
+    *,
+    include_insights: Annotated[
+        bool, Field(description="True to add reach, views, replies, shares and interactions for each live story.")
+    ] = False,
+) -> dict[str, Any]:
     """Currently active stories (last 24 h) with media URLs and permalinks.
 
     include_insights=True adds reach, views, replies, shares, total_interactions per story.
     Story insights disappear after 24 h, so fetch them while the story is live.
     """
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         stories = client.get(f"{acct.ig_user_id}/stories", fields=STORY_FIELDS).get("data") or []
@@ -555,12 +760,26 @@ def list_stories(account: str | None = None, *, include_insights: bool = False) 
             if errors:
                 out["errors"] = errors
         return out
+
     return _guard("list_stories", {"account": account, "include_insights": include_insights}, _impl)
 
 
-@mcp.tool()
-def top_posts(account: str | None = None, *, since: str | None = None, until: str | None = None,
-              metric: str = "reach", n: int = 10, media_type: str | None = None) -> dict[str, Any]:
+@mcp.tool(annotations={"title": "Top posts", "readOnlyHint": True, "openWorldHint": True})
+def top_posts(
+    account: AccountArg = None,
+    *,
+    since: Annotated[str | None, Field(description='Start date, e.g. "2026-10-01" (default: 30 days ago).')] = None,
+    until: Annotated[str | None, Field(description='End date (inclusive), e.g. "2026-10-31" (default: now).')] = None,
+    metric: Annotated[
+        Literal["reach", "views", "likes", "comments", "shares", "saved", "total_interactions"],
+        Field(description="Insight metric used for ranking (highest first)."),
+    ] = "reach",
+    n: Annotated[int, Field(description="How many top posts to return, 1-100 (default 10).")] = 10,
+    media_type: Annotated[
+        Literal["REELS", "FEED", "IMAGE", "VIDEO", "CAROUSEL_ALBUM"] | None,
+        Field(description="Only rank this kind of post. Optional."),
+    ] = None,
+) -> dict[str, Any]:
     """Best-performing posts in a date range, ranked by an insight metric.
 
     since/until: dates like 2026-10-01 (default: last 30 days). metric: reach | views |
@@ -568,8 +787,10 @@ def top_posts(account: str | None = None, *, since: str | None = None, until: st
     (REELS, IMAGE, VIDEO, CAROUSEL_ALBUM, FEED). Per-post insights are fetched in Graph
     batch requests (50 posts per call) to save rate limit.
     """
+
     def _impl() -> dict[str, Any]:
         from datetime import timedelta
+
         client, acct = auth.client_for(account)
         if metric not in SORT_METRICS:
             raise V.ValidationError(f"metric must be one of {sorted(SORT_METRICS)}")
@@ -584,38 +805,69 @@ def top_posts(account: str | None = None, *, since: str | None = None, until: st
             ts = item.get("timestamp")
             return bool(ts and V.parse_graph_time(ts) < start)
 
-        posts, _ = client.paginate(f"{acct.ig_user_id}/media", fields=MEDIA_FIELDS,
-                                   max_items=CEIL_MEDIA, stop=too_old)
+        posts, _ = client.paginate(f"{acct.ig_user_id}/media", fields=MEDIA_FIELDS, max_items=CEIL_MEDIA, stop=too_old)
         posts = [p for p in posts if p.get("timestamp") and V.parse_graph_time(p["timestamp"]) < end]
         if kind:
-            posts = [p for p in posts if kind in {(p.get("media_product_type") or "").upper(),
-                                                   (p.get("media_type") or "").upper()}]
+            posts = [
+                p
+                for p in posts
+                if kind in {(p.get("media_product_type") or "").upper(), (p.get("media_type") or "").upper()}
+            ]
         errors = _batch_media_insights(client, posts)
-        ranked = sorted((p for p in posts if "metrics" in p),
-                        key=lambda p: p["metrics"].get(metric) or -1, reverse=True)[:top_n]
-        result = [{"id": p["id"], "timestamp": p.get("timestamp"), "permalink": p.get("permalink"),
-                   "media_type": p.get("media_type"), "media_product_type": p.get("media_product_type"),
-                   "caption": (p.get("caption") or "")[:120], "metrics": p["metrics"]} for p in ranked]
-        out: dict[str, Any] = {"ok": True, "account": acct.label, "metric": metric,
-                               "since": start.isoformat(), "until": end.isoformat(),
-                               "posts_considered": len(posts), "posts": result}
+        ranked = sorted(
+            (p for p in posts if "metrics" in p), key=lambda p: p["metrics"].get(metric) or -1, reverse=True
+        )[:top_n]
+        result = [
+            {
+                "id": p["id"],
+                "timestamp": p.get("timestamp"),
+                "permalink": p.get("permalink"),
+                "media_type": p.get("media_type"),
+                "media_product_type": p.get("media_product_type"),
+                "caption": (p.get("caption") or "")[:120],
+                "metrics": p["metrics"],
+            }
+            for p in ranked
+        ]
+        out: dict[str, Any] = {
+            "ok": True,
+            "account": acct.label,
+            "metric": metric,
+            "since": start.isoformat(),
+            "until": end.isoformat(),
+            "posts_considered": len(posts),
+            "posts": result,
+        }
         if errors:
             out["errors"] = errors
         return out
-    return _guard("top_posts", {"account": account, "since": since, "until": until, "metric": metric,
-                                "n": n, "media_type": media_type}, _impl)
+
+    return _guard(
+        "top_posts",
+        {"account": account, "since": since, "until": until, "metric": metric, "n": n, "media_type": media_type},
+        _impl,
+    )
 
 
-@mcp.tool()
-def insights_summary(account: str | None = None, *, period: str = "last_30_days") -> dict[str, Any]:
+@mcp.tool(annotations={"title": "Insights summary", "readOnlyHint": True, "openWorldHint": True})
+def insights_summary(
+    account: AccountArg = None,
+    *,
+    period: Annotated[
+        Literal["last_7_days", "last_30_days", "last_90_days"],
+        Field(description="Period to summarise; it is compared with the same-length period before it."),
+    ] = "last_30_days",
+) -> dict[str, Any]:
     """Account totals for a recent period compared with the period before it.
 
     period: last_7_days | last_30_days | last_90_days. Returns views, reach,
     accounts_engaged, total_interactions, profile_views for both periods, % change,
     current follower count and new followers (last 30 days max).
     """
+
     def _impl() -> dict[str, Any]:
         from datetime import timedelta
+
         client, acct = auth.client_for(account)
         if period not in SUMMARY_PERIODS:
             raise V.ValidationError(f"period must be one of {sorted(SUMMARY_PERIODS)}")
@@ -623,42 +875,62 @@ def insights_summary(account: str | None = None, *, period: str = "last_30_days"
         today = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         cur = (today - timedelta(days=days), today)
         prev = (today - timedelta(days=2 * days), cur[0])
-        cur_rows, errs1, notes = _account_insights_range(client, acct, ["follower_count"],
-                                                         list(SUMMARY_TOTALS), *cur)
+        cur_rows, errs1, notes = _account_insights_range(client, acct, ["follower_count"], list(SUMMARY_TOTALS), *cur)
         prev_rows, errs2, _ = _account_insights_range(client, acct, [], list(SUMMARY_TOTALS), *prev)
 
         def totals(rows):
             return {r["name"]: r["total_value"]["value"] for r in rows if "total_value" in r}
 
         current, previous = totals(cur_rows), totals(prev_rows)
-        change = {k: (round((current[k] - previous[k]) / previous[k] * 100, 1) if previous.get(k) else None)
-                  for k in current if k in previous}
+        change = {
+            k: (round((current[k] - previous[k]) / previous[k] * 100, 1) if previous.get(k) else None)
+            for k in current
+            if k in previous
+        }
         fc = next((r for r in cur_rows if r["name"] == "follower_count"), None)
         new_followers = sum(v.get("value") or 0 for v in (fc or {}).get("values", [])) if fc else None
         profile = client.get(acct.ig_user_id, fields="followers_count")
-        out: dict[str, Any] = {"ok": True, "account": acct.label, "period": period,
-                               "current_range": [cur[0].date().isoformat(), cur[1].date().isoformat()],
-                               "previous_range": [prev[0].date().isoformat(), prev[1].date().isoformat()],
-                               "current": current, "previous": previous, "change_pct": change,
-                               "followers_now": profile.get("followers_count"),
-                               "new_followers": new_followers}
+        out: dict[str, Any] = {
+            "ok": True,
+            "account": acct.label,
+            "period": period,
+            "current_range": [cur[0].date().isoformat(), cur[1].date().isoformat()],
+            "previous_range": [prev[0].date().isoformat(), prev[1].date().isoformat()],
+            "current": current,
+            "previous": previous,
+            "change_pct": change,
+            "followers_now": profile.get("followers_count"),
+            "new_followers": new_followers,
+        }
         if days > 30:
-            out["note"] = ("reach and accounts_engaged are summed over 30-day windows and may count the "
-                           "same person more than once; new_followers covers the last 30 days only.")
+            out["note"] = (
+                "reach and accounts_engaged are summed over 30-day windows and may count the "
+                "same person more than once; new_followers covers the last 30 days only."
+            )
         if errs1 or errs2:
             out["errors"] = errs1 + errs2
         return out
+
     return _guard("insights_summary", {"account": account, "period": period}, _impl)
 
 
-@mcp.tool()
-def get_media_insights(media_id: str, account: str | None = None, *, metrics: str | None = None) -> dict[str, Any]:
+@mcp.tool(annotations={"title": "Post insights", "readOnlyHint": True, "openWorldHint": True})
+def get_media_insights(
+    media_id: MediaIdArg,
+    account: AccountArg = None,
+    *,
+    metrics: Annotated[
+        str | None,
+        Field(description="Comma-separated metric names to override the automatic per-type defaults. Optional."),
+    ] = None,
+) -> dict[str, Any]:
     """Per-post analytics. Picks the right default metrics for the post type.
 
     Feed posts/carousels: reach, likes, comments, shares, saved, total_interactions, views.
     Reels add ig_reels_avg_watch_time + ig_reels_video_view_total_time. Stories: reach,
     views, replies, shares, total_interactions. Pass `metrics` (comma-separated) to override.
     """
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         mid = V.validate_graph_id(media_id, field="media_id")
@@ -670,25 +942,40 @@ def get_media_insights(media_id: str, account: str | None = None, *, metrics: st
             product = info.get("media_product_type")
             names = list(IM.media_metrics_for(product))
         data = client.get(f"{mid}/insights", metric=",".join(names))
-        out: dict[str, Any] = {"ok": True, "account": acct.label, "media_id": mid,
-                               "insights": data.get("data", [])}
+        out: dict[str, Any] = {"ok": True, "account": acct.label, "media_id": mid, "insights": data.get("data", [])}
         if product:
             out["media_product_type"] = product
         return out
+
     return _guard("get_media_insights", {"media_id": media_id, "account": account, "metrics": metrics}, _impl)
 
 
-AUDIENCE_HINT = ("Meta returns this when demographics are unavailable: the account needs "
-                 ">=100 followers, and only one breakdown per request is allowed. Try a single "
-                 "breakdown (age|gender|country|city) or, for engaged_audience_demographics, a "
-                 "timeframe (this_week|this_month).")
+AUDIENCE_HINT = (
+    "Meta returns this when demographics are unavailable: the account needs "
+    ">=100 followers, and only one breakdown per request is allowed. Try a single "
+    "breakdown (age|gender|country|city) or, for engaged_audience_demographics, a "
+    "timeframe (this_week|this_month)."
+)
 
 
-@mcp.tool()
-def get_audience_insights(account: str | None = None, *, metric: str | None = None,
-                          period: str = "lifetime", metric_type: str = "total_value",
-                          breakdown: str | None = "age,gender,country,city",
-                          timeframe: str | None = None) -> dict[str, Any]:
+@mcp.tool(annotations={"title": "Audience demographics", "readOnlyHint": True, "openWorldHint": True})
+def get_audience_insights(
+    account: AccountArg = None,
+    *,
+    metric: Annotated[
+        Literal["follower_demographics", "engaged_audience_demographics"] | None,
+        Field(
+            description="follower_demographics (all followers, default) or engaged_audience_demographics (people who interacted)."
+        ),
+    ] = None,
+    breakdown: Annotated[
+        str | None, Field(description="Comma-separated breakdowns among age, gender, country, city (default all four).")
+    ] = "age,gender,country,city",
+    timeframe: Annotated[
+        Literal["this_week", "this_month"] | None,
+        Field(description="Time window, needed for engaged_audience_demographics. Optional."),
+    ] = None,
+) -> dict[str, Any]:
     """Follower demographics by age, gender, country and city.
 
     Meta allows ONE breakdown per request, so each breakdown in `breakdown`
@@ -697,6 +984,7 @@ def get_audience_insights(account: str | None = None, *, metric: str | None = No
     engaged_audience_demographics (pass timeframe=this_week|this_month for that one).
     Needs >=100 followers (Meta privacy floor).
     """
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         m = metric or IM.DEFAULT_AUDIENCE_METRIC
@@ -704,47 +992,74 @@ def get_audience_insights(account: str | None = None, *, metric: str | None = No
         result: dict[str, Any] = {}
         errors: list[dict[str, Any]] = []
         for dim in dims:
-            params: dict[str, Any] = {"metric": m, "period": period, "metric_type": metric_type,
-                                      "breakdown": dim, "timeframe": timeframe}
+            params: dict[str, Any] = {
+                "metric": m,
+                "period": "lifetime",
+                "metric_type": "total_value",
+                "breakdown": dim,
+                "timeframe": timeframe,
+            }
             try:
                 result[dim] = client.get(f"{acct.ig_user_id}/insights", **params).get("data", [])
             except graph_client.GraphAPIError as exc:
-                errors.append({"breakdown": dim, "error": audit.sanitize_error(str(exc)),
-                               "error_class": exc.error_class})
+                errors.append(
+                    {"breakdown": dim, "error": audit.sanitize_error(str(exc)), "error_class": exc.error_class}
+                )
         if not result:
-            return {"ok": False, "account": acct.label, "metric": m,
-                    "error": errors[0]["error"] if errors else "no breakdowns requested",
-                    "error_class": errors[0]["error_class"] if errors else "validation",
-                    "errors": errors, "hint": AUDIENCE_HINT}
+            return {
+                "ok": False,
+                "account": acct.label,
+                "metric": m,
+                "error": errors[0]["error"] if errors else "no breakdowns requested",
+                "error_class": errors[0]["error_class"] if errors else "validation",
+                "errors": errors,
+                "hint": AUDIENCE_HINT,
+            }
         out: dict[str, Any] = {"ok": True, "account": acct.label, "metric": m, "breakdowns": result}
         if errors:
             out["errors"] = errors
             out["hint"] = AUDIENCE_HINT
         return out
-    return _guard("get_audience_insights",
-                  {"account": account, "metric": metric, "period": period, "breakdown": breakdown}, _impl)
+
+    return _guard("get_audience_insights", {"account": account, "metric": metric, "breakdown": breakdown}, _impl)
 
 
 # =============================== PUBLISHING =============================== #
 
-@mcp.tool()
-def publishing_limit(account: str | None = None) -> dict[str, Any]:
+
+@mcp.tool(annotations={"title": "Publishing quota", "readOnlyHint": True, "openWorldHint": True})
+def publishing_limit(account: AccountArg = None) -> dict[str, Any]:
     """Remaining posts in the rolling 24h publishing quota (Instagram caps API posts/day)."""
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
-        data = client.get(f"{acct.ig_user_id}/content_publishing_limit",
-                           fields="config,quota_usage")
+        data = client.get(f"{acct.ig_user_id}/content_publishing_limit", fields="config,quota_usage")
         return {"ok": True, "account": acct.label, "limit": data.get("data", [])}
+
     return _guard("publishing_limit", {"account": account}, _impl)
 
 
-@mcp.tool()
-def publish_container(container_id: str, account: str | None = None) -> dict[str, Any]:
-    """Finish publishing a media container created earlier (e.g. a video that was still
-    processing when publish_video/publish_reel/publish_story timed out).
+@mcp.tool(
+    annotations={
+        "title": "Finish pending publish",
+        "readOnlyHint": False,
+        "openWorldHint": True,
+        "destructiveHint": False,
+    }
+)
+def publish_container(
+    container_id: Annotated[
+        str, Field(description="Container id returned in an earlier publish result (container_id field).")
+    ],
+    account: AccountArg = None,
+) -> dict[str, Any]:
+    """Publish a prepared container publicly (e.g. a video that was still processing).
+
+    Use the container_id from an earlier publish_video/publish_reel/publish_story result.
 
     Publishes if processing is FINISHED; otherwise returns ok=false with its status_code.
     """
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         cid = V.validate_graph_id(container_id, field="container_id")
@@ -753,45 +1068,86 @@ def publish_container(container_id: str, account: str | None = None) -> dict[str
         if code == "FINISHED":
             return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid)}
         if code == "ERROR":
-            raise graph_client.GraphAPIError(f"media container {cid} processing failed: {status.get('status')}",
-                                             error_class="upstream_error")
-        return {"ok": False, "account": acct.label, "container_id": cid, "status_code": code,
-                "error_class": "not_ready", "hint": "Still processing; try again in a minute."}
+            raise graph_client.GraphAPIError(
+                f"media container {cid} processing failed: {status.get('status')}", error_class="upstream_error"
+            )
+        return {
+            "ok": False,
+            "account": acct.label,
+            "container_id": cid,
+            "status_code": code,
+            "error_class": "not_ready",
+            "hint": "Still processing; try again in a minute.",
+        }
+
     return _guard("publish_container", {"container_id": container_id, "account": account}, _impl)
 
 
-@mcp.tool()
-def publish_image(image_url: str, caption: str | None = None, account: str | None = None, *,
-                  alt_text: str | None = None, user_tags: list[dict[str, Any]] | None = None,
-                  location_id: str | int | None = None, collaborators: list[str] | None = None) -> dict[str, Any]:
-    """Publish a single image to the feed.
+@mcp.tool(
+    annotations={"title": "Publish image post", "readOnlyHint": False, "openWorldHint": True, "destructiveHint": False}
+)
+def publish_image(
+    image_url: Annotated[str, Field(description="Public https URL of a JPEG image; Instagram downloads it itself.")],
+    caption: CaptionArg = None,
+    account: AccountArg = None,
+    *,
+    alt_text: Annotated[
+        str | None, Field(description="Accessibility description of the image (up to 1000 characters). Optional.")
+    ] = None,
+    user_tags: Annotated[
+        list[dict[str, Any]] | None,
+        Field(
+            description="People to tag: list of {username, x, y} with x/y between 0 and 1 measured from the top-left. Optional."
+        ),
+    ] = None,
+    location_id: LocationIdArg = None,
+    collaborators: CollaboratorsArg = None,
+) -> dict[str, Any]:
+    """Publish a single-image post to the feed (publicly visible; the API cannot delete posts).
 
     image_url must be a PUBLIC https URL (Instagram fetches the bytes itself). caption
     <= 2200 chars, <= 30 hashtags, <= 20 @mentions. Optional: alt_text (accessibility,
     <= 1000 chars), user_tags [{username, x, y}] with x/y 0-1 from the top-left,
     location_id (Facebook location Page id), collaborators (<= 3 usernames, they get an invite).
     """
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         url = V.validate_public_https_url(image_url, field="image_url")
-        params = {"image_url": url, "caption": V.validate_caption(caption),
-                  "alt_text": V.validate_alt_text(alt_text),
-                  "user_tags": V.validate_user_tags(user_tags),
-                  "location_id": V.validate_location_id(location_id),
-                  "collaborators": V.validate_collaborators(collaborators)}
+        params = {
+            "image_url": url,
+            "caption": V.validate_caption(caption),
+            "alt_text": V.validate_alt_text(alt_text),
+            "user_tags": V.validate_user_tags(user_tags),
+            "location_id": V.validate_location_id(location_id),
+            "collaborators": V.validate_collaborators(collaborators),
+        }
         container = client.post(f"{acct.ig_user_id}/media", **params)
         cid = container.get("id")
         return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid)}
-    return _guard("publish_image", {"image_url": image_url, "caption": V.truncate(caption or ""),
-                                    "account": account}, _impl)
+
+    return _guard(
+        "publish_image", {"image_url": image_url, "caption": V.truncate(caption or ""), "account": account}, _impl
+    )
 
 
-@mcp.tool()
-def publish_video(video_url: str, caption: str | None = None, account: str | None = None) -> dict[str, Any]:
-    """Publish a video to the feed. video_url must be a PUBLIC https URL.
+@mcp.tool(
+    annotations={"title": "Publish video post", "readOnlyHint": False, "openWorldHint": True, "destructiveHint": False}
+)
+def publish_video(
+    video_url: Annotated[
+        str, Field(description="Public https URL of an MP4/MOV video; Instagram downloads it itself.")
+    ],
+    caption: CaptionArg = None,
+    account: AccountArg = None,
+) -> dict[str, Any]:
+    """Publish a video post to the feed (publicly visible; the API cannot delete posts).
 
-    Video containers process asynchronously; this polls status up to 90s before publishing.
+    Instagram downloads the video from video_url and processes it; this waits up to
+    INSTAGRAM_MCP_VIDEO_WAIT_S (default 300 s). On timeout nothing is published and the
+    result has container_id: finish later with publish_container.
     """
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         url = V.validate_public_https_url(video_url, field="video_url")
@@ -800,43 +1156,81 @@ def publish_video(video_url: str, caption: str | None = None, account: str | Non
         cid = container.get("id")
         _wait_container_ready(client, cid)
         return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid)}
-    return _guard("publish_video", {"video_url": video_url, "caption": V.truncate(caption or ""),
-                                    "account": account}, _impl)
+
+    return _guard(
+        "publish_video", {"video_url": video_url, "caption": V.truncate(caption or ""), "account": account}, _impl
+    )
 
 
-@mcp.tool()
-def publish_reel(video_url: str, caption: str | None = None, account: str | None = None,
-                 *, share_to_feed: bool = True, cover_url: str | None = None,
-                 thumb_offset: int | None = None, collaborators: list[str] | None = None,
-                 audio_name: str | None = None, location_id: str | int | None = None,
-                 user_tags: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """Publish a Reel. video_url must be a PUBLIC https URL.
+@mcp.tool(annotations={"title": "Publish reel", "readOnlyHint": False, "openWorldHint": True, "destructiveHint": False})
+def publish_reel(
+    video_url: Annotated[str, Field(description="Public https URL of an MP4/MOV video (vertical 9:16 recommended).")],
+    caption: CaptionArg = None,
+    account: AccountArg = None,
+    *,
+    share_to_feed: Annotated[
+        bool, Field(description="True (default) to also show the reel in the main profile grid.")
+    ] = True,
+    cover_url: Annotated[
+        str | None, Field(description="Public https URL of a cover image. Optional; alternatively use thumb_offset.")
+    ] = None,
+    thumb_offset: Annotated[
+        int | None, Field(description="Cover frame position in milliseconds from the start of the video. Optional.")
+    ] = None,
+    collaborators: CollaboratorsArg = None,
+    audio_name: Annotated[
+        str | None, Field(description="Name for the reel's original audio (up to 100 characters). Optional.")
+    ] = None,
+    location_id: LocationIdArg = None,
+    user_tags: Annotated[
+        list[dict[str, Any]] | None, Field(description="People to tag: list of {username}. Optional.")
+    ] = None,
+) -> dict[str, Any]:
+    """Publish a reel (publicly visible; the API cannot delete posts).
 
     share_to_feed also shows it in the main grid. Cover: cover_url (image) or
     thumb_offset (milliseconds into the video). Optional collaborators (<= 3), audio_name
     (renames original audio), location_id, user_tags [{username}]. Processing is polled
     up to INSTAGRAM_MCP_VIDEO_WAIT_S (default 300 s); on timeout use publish_container.
     """
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         url = V.validate_public_https_url(video_url, field="video_url")
         cover = V.validate_public_https_url(cover_url, field="cover_url") if cover_url else None
-        if thumb_offset is not None and (isinstance(thumb_offset, bool) or not isinstance(thumb_offset, int)
-                                         or thumb_offset < 0):
+        if thumb_offset is not None and (
+            isinstance(thumb_offset, bool) or not isinstance(thumb_offset, int) or thumb_offset < 0
+        ):
             raise V.ValidationError("thumb_offset must be a whole number of milliseconds >= 0")
         if audio_name is not None and (not isinstance(audio_name, str) or len(audio_name) > 100):
             raise V.ValidationError("audio_name must be text of at most 100 characters")
-        container = client.post(f"{acct.ig_user_id}/media", media_type="REELS", video_url=url,
-                                caption=V.validate_caption(caption), share_to_feed=share_to_feed,
-                                cover_url=cover, thumb_offset=thumb_offset, audio_name=audio_name,
-                                collaborators=V.validate_collaborators(collaborators),
-                                location_id=V.validate_location_id(location_id),
-                                user_tags=V.validate_user_tags(user_tags, require_xy=False))
+        container = client.post(
+            f"{acct.ig_user_id}/media",
+            media_type="REELS",
+            video_url=url,
+            caption=V.validate_caption(caption),
+            share_to_feed=share_to_feed,
+            cover_url=cover,
+            thumb_offset=thumb_offset,
+            audio_name=audio_name,
+            collaborators=V.validate_collaborators(collaborators),
+            location_id=V.validate_location_id(location_id),
+            user_tags=V.validate_user_tags(user_tags, require_xy=False),
+        )
         cid = container.get("id")
         _wait_container_ready(client, cid)
         return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid)}
-    return _guard("publish_reel", {"video_url": video_url, "caption": V.truncate(caption or ""),
-                                   "share_to_feed": share_to_feed, "account": account}, _impl)
+
+    return _guard(
+        "publish_reel",
+        {
+            "video_url": video_url,
+            "caption": V.truncate(caption or ""),
+            "share_to_feed": share_to_feed,
+            "account": account,
+        },
+        _impl,
+    )
 
 
 CAROUSEL_MAX = int(os.environ.get("INSTAGRAM_MCP_CAROUSEL_MAX", "10"))
@@ -847,16 +1241,26 @@ def _is_video_url(url: str) -> bool:
     return url.split("?", 1)[0].lower().endswith(_VIDEO_EXT)
 
 
-@mcp.tool()
-def publish_carousel(image_urls: list[str], caption: str | None = None,
-                     account: str | None = None, *, collaborators: list[str] | None = None,
-                     location_id: str | int | None = None) -> dict[str, Any]:
-    """Publish a carousel of 2-10 items (images and/or videos). Each URL must be PUBLIC https.
+@mcp.tool(
+    annotations={"title": "Publish carousel", "readOnlyHint": False, "openWorldHint": True, "destructiveHint": False}
+)
+def publish_carousel(
+    image_urls: Annotated[
+        list[str], Field(description="2-10 public https URLs, in order; .mp4/.mov/.m4v items are uploaded as videos.")
+    ],
+    caption: CaptionArg = None,
+    account: AccountArg = None,
+    *,
+    collaborators: CollaboratorsArg = None,
+    location_id: LocationIdArg = None,
+) -> dict[str, Any]:
+    """Publish a carousel of 2-10 images/videos (publicly visible; the API cannot delete posts).
 
     Items ending in .mp4/.mov/.m4v are uploaded as videos and waited on before the
     carousel is created. Optional collaborators (<= 3) and location_id. The item limit
     can be raised with INSTAGRAM_MCP_CAROUSEL_MAX if Meta allows more for the account.
     """
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         if not isinstance(image_urls, list) or not (2 <= len(image_urls) <= CAROUSEL_MAX):
@@ -869,8 +1273,7 @@ def publish_carousel(image_urls: list[str], caption: str | None = None,
         video_ids: list[str] = []
         for u in urls:
             if _is_video_url(u):
-                child = client.post(f"{acct.ig_user_id}/media", media_type="VIDEO", video_url=u,
-                                    is_carousel_item=True)
+                child = client.post(f"{acct.ig_user_id}/media", media_type="VIDEO", video_url=u, is_carousel_item=True)
                 video_ids.append(child.get("id"))
             else:
                 child = client.post(f"{acct.ig_user_id}/media", image_url=u, is_carousel_item=True)
@@ -880,25 +1283,53 @@ def publish_carousel(image_urls: list[str], caption: str | None = None,
                 _wait_container_ready(client, vid)
             except graph_client.GraphAPIError as exc:
                 raise graph_client.GraphAPIError(
-                    str(exc), error_class=exc.error_class,
-                    extra={"child_container_ids": child_ids,
-                           "hint": "A carousel video is still processing (or failed); nothing was "
-                                   "published. Run publish_carousel again later (carousel items "
-                                   "cannot be published on their own)."}) from exc
-        parent = client.post(f"{acct.ig_user_id}/media", media_type="CAROUSEL",
-                             children=",".join(child_ids), caption=cap, collaborators=collab,
-                             location_id=loc)
+                    str(exc),
+                    error_class=exc.error_class,
+                    extra={
+                        "child_container_ids": child_ids,
+                        "hint": "A carousel video is still processing (or failed); nothing was "
+                        "published. Run publish_carousel again later (carousel items "
+                        "cannot be published on their own).",
+                    },
+                ) from exc
+        parent = client.post(
+            f"{acct.ig_user_id}/media",
+            media_type="CAROUSEL",
+            children=",".join(child_ids),
+            caption=cap,
+            collaborators=collab,
+            location_id=loc,
+        )
         cid = parent.get("id")
-        return {"account": acct.label, "child_count": len(child_ids),
-                **_publish_container(client, acct.ig_user_id, cid)}
-    return _guard("publish_carousel", {"image_count": len(image_urls or []),
-                                       "caption": V.truncate(caption or ""), "account": account}, _impl)
+        return {
+            "account": acct.label,
+            "child_count": len(child_ids),
+            **_publish_container(client, acct.ig_user_id, cid),
+        }
+
+    return _guard(
+        "publish_carousel",
+        {"image_count": len(image_urls or []), "caption": V.truncate(caption or ""), "account": account},
+        _impl,
+    )
 
 
-@mcp.tool()
-def publish_story(image_url: str | None = None, video_url: str | None = None,
-                  account: str | None = None) -> dict[str, Any]:
-    """Publish a Story (image OR video). Exactly one of image_url / video_url, PUBLIC https."""
+@mcp.tool(
+    annotations={"title": "Publish story", "readOnlyHint": False, "openWorldHint": True, "destructiveHint": False}
+)
+def publish_story(
+    image_url: Annotated[
+        str | None, Field(description="Public https URL of the story image. Pass this or video_url, not both.")
+    ] = None,
+    video_url: Annotated[
+        str | None, Field(description="Public https URL of the story video. Pass this or image_url, not both.")
+    ] = None,
+    account: AccountArg = None,
+) -> dict[str, Any]:
+    """Publish a story for 24 hours (publicly visible to followers).
+
+    Pass exactly one of image_url or video_url (public https URLs)."""
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         if bool(image_url) == bool(video_url):
@@ -913,51 +1344,77 @@ def publish_story(image_url: str | None = None, video_url: str | None = None,
             cid = container.get("id")
             _wait_container_ready(client, cid)
         return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid)}
+
     return _guard("publish_story", {"image_url": image_url, "video_url": video_url, "account": account}, _impl)
 
 
 # ================================ COMMENTS ================================ #
 
-@mcp.tool()
-def get_comments(media_id: str, account: str | None = None, *, limit: int | str = 25,
-                 after: str | None = None, include_replies: bool = False) -> dict[str, Any]:
+
+@mcp.tool(annotations={"title": "List comments", "readOnlyHint": True, "openWorldHint": True})
+def get_comments(
+    media_id: MediaIdArg,
+    account: AccountArg = None,
+    *,
+    limit: Annotated[int | str, Field(description='How many top-level comments: 1-5000 or "all" (default 25).')] = 25,
+    after: AfterArg = None,
+    include_replies: Annotated[bool, Field(description="True to include the replies under each comment.")] = False,
+) -> dict[str, Any]:
     """List top-level comments on a post (text, username, timestamp, like_count, hidden).
 
     limit: 1-5000 or "all". include_replies=True also returns each comment's replies
     (for a very long thread use get_comment_replies). Note: Meta's comments_count on a
     post also counts comments the API does not return (e.g. hidden/restricted).
     """
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         mid = V.validate_graph_id(media_id, field="media_id")
         lim = V.validate_limit(limit, ceiling=CEIL_COMMENTS, all_ceiling=CEIL_COMMENTS)
         fields = COMMENT_WITH_REPLIES_FIELDS if include_replies else COMMENT_FIELDS
-        items, cursor = client.paginate(f"{mid}/comments", fields=fields, max_items=lim,
-                                        after=V.validate_cursor(after))
+        items, cursor = client.paginate(f"{mid}/comments", fields=fields, max_items=lim, after=V.validate_cursor(after))
         out = _paged({"ok": True, "account": acct.label, "media_id": mid}, items, cursor, "comments")
         if include_replies:
             out["reply_count"] = sum(len((c.get("replies") or {}).get("data") or []) for c in items)
         return out
+
     return _guard("get_comments", {"media_id": media_id, "account": account, "limit": limit}, _impl)
 
 
-@mcp.tool()
-def get_comment_replies(comment_id: str, account: str | None = None, *, limit: int | str = 50,
-                        after: str | None = None) -> dict[str, Any]:
+@mcp.tool(annotations={"title": "List comment replies", "readOnlyHint": True, "openWorldHint": True})
+def get_comment_replies(
+    comment_id: CommentIdArg,
+    account: AccountArg = None,
+    *,
+    limit: Annotated[int | str, Field(description='How many replies: 1-5000 or "all" (default 50).')] = 50,
+    after: AfterArg = None,
+) -> dict[str, Any]:
     """List replies under one comment. limit 1-5000 or "all"; returns next_cursor if more."""
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         cid = V.validate_graph_id(comment_id, field="comment_id")
         lim = V.validate_limit(limit, default=50, ceiling=CEIL_COMMENTS, all_ceiling=CEIL_COMMENTS)
-        items, cursor = client.paginate(f"{cid}/replies", fields=COMMENT_FIELDS, max_items=lim,
-                                        after=V.validate_cursor(after))
+        items, cursor = client.paginate(
+            f"{cid}/replies", fields=COMMENT_FIELDS, max_items=lim, after=V.validate_cursor(after)
+        )
         return _paged({"ok": True, "account": acct.label, "comment_id": cid}, items, cursor, "replies")
+
     return _guard("get_comment_replies", {"comment_id": comment_id, "account": account, "limit": limit}, _impl)
 
 
-@mcp.tool()
-def reply_to_comment(comment_id: str, message: str, account: str | None = None) -> dict[str, Any]:
-    """Reply to a comment. message <= 2200 chars. Returns the new comment id."""
+@mcp.tool(
+    annotations={"title": "Reply to comment", "readOnlyHint": False, "openWorldHint": True, "destructiveHint": False}
+)
+def reply_to_comment(
+    comment_id: CommentIdArg,
+    message: Annotated[
+        str, Field(description="Reply text (up to 2200 characters). Posted publicly under the comment.")
+    ],
+    account: AccountArg = None,
+) -> dict[str, Any]:
+    """Reply publicly under a comment (up to 2200 characters). Returns the new comment id."""
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         cid = V.validate_graph_id(comment_id, field="comment_id")
@@ -966,99 +1423,169 @@ def reply_to_comment(comment_id: str, message: str, account: str | None = None) 
             raise V.ValidationError("message must be non-empty")
         res = client.post(f"{cid}/replies", message=msg)
         return {"ok": True, "account": acct.label, "comment_id": res.get("id")}
-    return _guard("reply_to_comment", {"comment_id": comment_id, "message": V.truncate(message),
-                                       "account": account}, _impl)
+
+    return _guard(
+        "reply_to_comment", {"comment_id": comment_id, "message": V.truncate(message), "account": account}, _impl
+    )
 
 
-@mcp.tool()
-def hide_comment(comment_id: str, hide: bool = True, account: str | None = None) -> dict[str, Any]:
+@mcp.tool(
+    annotations={
+        "title": "Hide or unhide comment",
+        "readOnlyHint": False,
+        "openWorldHint": True,
+        "destructiveHint": False,
+    }
+)
+def hide_comment(
+    comment_id: CommentIdArg,
+    hide: Annotated[
+        bool, Field(description="True (default) hides the comment from public view; false unhides it.")
+    ] = True,
+    account: AccountArg = None,
+) -> dict[str, Any]:
     """Hide (or unhide) a comment from public view. hide=false unhides."""
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         cid = V.validate_graph_id(comment_id, field="comment_id")
         client.post(cid, hide=bool(hide))
         return {"ok": True, "account": acct.label, "comment_id": cid, "hidden": bool(hide)}
+
     return _guard("hide_comment", {"comment_id": comment_id, "hide": hide, "account": account}, _impl)
 
 
-@mcp.tool()
-def delete_comment(comment_id: str, account: str | None = None) -> dict[str, Any]:
-    """Permanently delete a comment you own (or a comment on your media). Irreversible."""
+@mcp.tool(
+    annotations={"title": "Delete comment", "readOnlyHint": False, "openWorldHint": True, "destructiveHint": True}
+)
+def delete_comment(comment_id: CommentIdArg, account: AccountArg = None) -> dict[str, Any]:
+    """Permanently delete a comment on your posts (or your own reply). Cannot be undone."""
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         cid = V.validate_graph_id(comment_id, field="comment_id")
         client.delete(cid)
         return {"ok": True, "account": acct.label, "comment_id": cid, "deleted": True}
+
     return _guard("delete_comment", {"comment_id": comment_id, "account": account}, _impl)
 
 
 # ================================ DISCOVERY ================================ #
 
-@mcp.tool()
-def search_hashtag(hashtag: str, account: str | None = None) -> dict[str, Any]:
+
+@mcp.tool(annotations={"title": "Find hashtag id", "readOnlyHint": True, "openWorldHint": True})
+def search_hashtag(
+    hashtag: Annotated[
+        str,
+        Field(
+            description='Hashtag to look up, with or without #, e.g. "fitness". Counts toward 30 unique hashtags per 7 days.'
+        ),
+    ],
+    account: AccountArg = None,
+) -> dict[str, Any]:
     """Resolve a hashtag name to its Graph id (needed before get_hashtag_media)."""
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         tag = V.validate_hashtag(hashtag)
         res = client.get("ig_hashtag_search", user_id=acct.ig_user_id, q=tag)
         return {"ok": True, "account": acct.label, "hashtag": tag, "results": res.get("data", [])}
+
     return _guard("search_hashtag", {"hashtag": hashtag, "account": account}, _impl)
 
 
-@mcp.tool()
-def get_hashtag_media(hashtag_id: str, account: str | None = None, *,
-                      edge: str = "top_media", limit: int | str = 25,
-                      after: str | None = None) -> dict[str, Any]:
+@mcp.tool(annotations={"title": "Hashtag posts", "readOnlyHint": True, "openWorldHint": True})
+def get_hashtag_media(
+    hashtag_id: Annotated[str, Field(description="Hashtag id from search_hashtag.")],
+    account: AccountArg = None,
+    *,
+    edge: Annotated[
+        Literal["top_media", "recent_media"],
+        Field(description="top_media (most popular) or recent_media (last 24 hours)."),
+    ] = "top_media",
+    limit: Annotated[int | str, Field(description='How many posts: 1-1000 or "all" (default 25).')] = 25,
+    after: AfterArg = None,
+) -> dict[str, Any]:
     """Recent or top media for a hashtag id. edge=top_media|recent_media. limit 1-1000 or "all".
 
     Get the hashtag_id from search_hashtag first. Subject to Meta's 30-unique-hashtags
     per-7-days query limit per account.
     """
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         hid = V.validate_graph_id(hashtag_id, field="hashtag_id")
         e = V.validate_enum(edge, {"top_media", "recent_media"}, field="edge", default="top_media")
         lim = V.validate_limit(limit, ceiling=CEIL_TAGS, all_ceiling=CEIL_TAGS)
-        items, cursor = client.paginate(f"{hid}/{e}", user_id=acct.ig_user_id,
-                                        fields="id,caption,media_type,permalink,like_count,comments_count,timestamp",
-                                        max_items=lim, after=V.validate_cursor(after), page_size=50)
-        return _paged({"ok": True, "account": acct.label, "hashtag_id": hid, "edge": e},
-                      items, cursor, "media")
-    return _guard("get_hashtag_media", {"hashtag_id": hashtag_id, "edge": edge, "limit": limit,
-                                        "account": account}, _impl)
+        items, cursor = client.paginate(
+            f"{hid}/{e}",
+            user_id=acct.ig_user_id,
+            fields="id,caption,media_type,permalink,like_count,comments_count,timestamp",
+            max_items=lim,
+            after=V.validate_cursor(after),
+            page_size=50,
+        )
+        return _paged({"ok": True, "account": acct.label, "hashtag_id": hid, "edge": e}, items, cursor, "media")
+
+    return _guard(
+        "get_hashtag_media", {"hashtag_id": hashtag_id, "edge": edge, "limit": limit, "account": account}, _impl
+    )
 
 
-@mcp.tool()
-def get_mentions(account: str | None = None, *, limit: int | str = 25,
-                 after: str | None = None) -> dict[str, Any]:
+@mcp.tool(annotations={"title": "Posts tagging the account", "readOnlyHint": True, "openWorldHint": True})
+def get_mentions(
+    account: AccountArg = None,
+    *,
+    limit: Annotated[
+        int | str, Field(description='How many posts that tag the account: 1-1000 or "all" (default 25).')
+    ] = 25,
+    after: AfterArg = None,
+) -> dict[str, Any]:
     """List media where the account is tagged/@-mentioned. limit 1-1000 or "all"."""
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         lim = V.validate_limit(limit, ceiling=CEIL_TAGS, all_ceiling=CEIL_TAGS)
-        items, cursor = client.paginate(f"{acct.ig_user_id}/tags", fields=MEDIA_FIELDS, max_items=lim,
-                                        after=V.validate_cursor(after))
+        items, cursor = client.paginate(
+            f"{acct.ig_user_id}/tags", fields=MEDIA_FIELDS, max_items=lim, after=V.validate_cursor(after)
+        )
         return _paged({"ok": True, "account": acct.label}, items, cursor, "media")
+
     return _guard("get_mentions", {"account": account, "limit": limit}, _impl)
 
 
-BD_PROFILE_FIELDS = ("username,name,biography,followers_count,follows_count,media_count,"
-                     "profile_picture_url,website")
+BD_PROFILE_FIELDS = "username,name,biography,followers_count,follows_count,media_count,profile_picture_url,website"
 BD_MEDIA_FIELDS = "id,caption,media_type,media_product_type,permalink,like_count,comments_count,timestamp"
 
 
-@mcp.tool()
-def business_discovery(username: str, account: str | None = None, *, with_media: bool = False,
-                       media_limit: int | str = 12) -> dict[str, Any]:
+@mcp.tool(annotations={"title": "Look up another business account", "readOnlyHint": True, "openWorldHint": True})
+def business_discovery(
+    username: Annotated[
+        str, Field(description='Instagram username of any Business/Creator account, without @, e.g. "nike".')
+    ],
+    account: AccountArg = None,
+    *,
+    with_media: Annotated[bool, Field(description="True to also return that account's recent posts.")] = False,
+    media_limit: Annotated[
+        int | str, Field(description='How many of their posts when with_media is true: 1-500 or "all" (default 12).')
+    ] = 12,
+) -> dict[str, Any]:
     """Public profile + (optionally) recent posts of ANY business/creator account by username.
 
     Read-only competitor/prospect research. Only works for Professional accounts.
     with_media pulls up to media_limit recent posts (1-500 or "all"), paging as needed.
     """
+
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         uname = V.validate_username(username)
-        lim = V.validate_limit(media_limit, ceiling=CEIL_DISCOVERY, all_ceiling=CEIL_DISCOVERY,
-                               default=12, field="media_limit") if with_media else 0
+        lim = (
+            V.validate_limit(
+                media_limit, ceiling=CEIL_DISCOVERY, all_ceiling=CEIL_DISCOVERY, default=12, field="media_limit"
+            )
+            if with_media
+            else 0
+        )
         profile: dict[str, Any] | None = None
         posts: list[dict[str, Any]] = []
         cursor: str | None = None
@@ -1083,13 +1610,12 @@ def business_discovery(username: str, account: str | None = None, *, with_media:
         result: dict[str, Any] = dict(profile or {})
         if with_media:
             result["media"] = {"data": posts[:lim]}
-        out: dict[str, Any] = {"ok": True, "account": acct.label, "target": uname,
-                               "business_discovery": result}
+        out: dict[str, Any] = {"ok": True, "account": acct.label, "target": uname, "business_discovery": result}
         if with_media and cursor and len(posts) >= lim:
             out["truncated"] = True
         return out
-    return _guard("business_discovery", {"username": username, "with_media": with_media,
-                                         "account": account}, _impl)
+
+    return _guard("business_discovery", {"username": username, "with_media": with_media, "account": account}, _impl)
 
 
 # ============================= DIRECT MESSAGES ============================= #
@@ -1107,37 +1633,54 @@ def _page_dm_client(client, acct):
     import hashlib
 
     from instagram_mcp import graph_client as _gc
+
     key = (acct.label, acct.ig_user_id, hashlib.sha256(acct.access_token.encode()).hexdigest())
     if key in _PAGE_CACHE:
         return _PAGE_CACHE[key]
-    slow = _gc.GraphClient(acct.access_token, base_host=acct.base_host,
-                           app_secret=acct.app_secret, timeout=120.0)
+    slow = _gc.GraphClient(acct.access_token, base_host=acct.base_host, app_secret=acct.app_secret, timeout=120.0)
     res = slow.get("me/accounts", fields="id,access_token,instagram_business_account", limit=100)
     for pg in res.get("data", []):
         if (pg.get("instagram_business_account") or {}).get("id") == acct.ig_user_id:
-            out = (_gc.GraphClient(pg["access_token"], base_host=acct.base_host,
-                                   app_secret=acct.app_secret, timeout=120.0), pg["id"])
+            out = (
+                _gc.GraphClient(
+                    pg["access_token"], base_host=acct.base_host, app_secret=acct.app_secret, timeout=120.0
+                ),
+                pg["id"],
+            )
             _PAGE_CACHE[key] = out
             return out
     raise V.ValidationError("no Facebook Page linked to this Instagram account was found in me/accounts")
 
 
-@mcp.tool()
-def list_conversations(account: str | None = None, *, limit: int | str = 5,
-                       after: str | None = None) -> dict[str, Any]:
+@mcp.tool(annotations={"title": "List DM conversations", "readOnlyHint": True, "openWorldHint": True})
+def list_conversations(
+    account: AccountArg = None,
+    *,
+    limit: Annotated[
+        int | str, Field(description='How many conversations, newest first: 1-200 or "all" (default 5).')
+    ] = 5,
+    after: AfterArg = None,
+) -> dict[str, Any]:
     """List Instagram DM conversations (newest first) with participant usernames.
     REQUIRES Meta App Review (instagram_manage_messages). limit 1-200 or "all" (default 5).
     Fetched one conversation per request: Meta rejects larger pages with
     'Please reduce the amount of data you're asking for'."""
+
     def _impl() -> dict[str, Any]:
         _require_dm()
         client, acct = auth.client_for(account)
         lim = V.validate_limit(limit, ceiling=CEIL_CONVERSATIONS, all_ceiling=CEIL_CONVERSATIONS)
         pclient, page_id = _page_dm_client(client, acct)
         from instagram_mcp import graph_client as _gc
+
         items: list = []
-        page = pclient.get(f"{page_id}/conversations", platform="instagram",
-                           fields="id,updated_time", limit=1, after=V.validate_cursor(after))
+        page = pclient.get(
+            f"{page_id}/conversations",
+            platform="instagram",
+            fields="id,updated_time",
+            limit=1,
+            after=V.validate_cursor(after),
+        )
         note = None
         nxt: str | None = None
         while True:
@@ -1149,10 +1692,12 @@ def list_conversations(account: str | None = None, *, limit: int | str = 5,
             if len(items) >= lim:
                 break
             try:  # later pages can hang in dev mode (hidden non-role conversations)
-                short = _gc.GraphClient(pclient._token, base_host=acct.base_host,
-                                        app_secret=acct.app_secret, timeout=20.0, max_attempts=1)
-                page = short.get(f"{page_id}/conversations", platform="instagram",
-                                 fields="id,updated_time", limit=1, after=nxt)
+                short = _gc.GraphClient(
+                    pclient._token, base_host=acct.base_host, app_secret=acct.app_secret, timeout=20.0, max_attempts=1
+                )
+                page = short.get(
+                    f"{page_id}/conversations", platform="instagram", fields="id,updated_time", limit=1, after=nxt
+                )
             except Exception:
                 nxt = None
                 note = "stopped early: Meta did not return more conversations (normal in development mode)"
@@ -1168,13 +1713,22 @@ def list_conversations(account: str | None = None, *, limit: int | str = 5,
         if note:
             out["note"] = note
         return out
+
     return _guard("list_conversations", {"account": account, "limit": limit}, _impl)
 
 
-@mcp.tool()
-def get_messages(conversation_id: str, account: str | None = None, *, limit: int | str = 10) -> dict[str, Any]:
+@mcp.tool(annotations={"title": "Read DM messages", "readOnlyHint": True, "openWorldHint": True})
+def get_messages(
+    conversation_id: ConversationIdArg,
+    account: AccountArg = None,
+    *,
+    limit: Annotated[
+        int | str, Field(description='How many messages, newest first: 1-100 or "all" (default 10).')
+    ] = 10,
+) -> dict[str, Any]:
     """Read messages in a DM conversation, newest first. limit 1-100 or "all" (default 10).
     REQUIRES Meta App Review (instagram_manage_messages)."""
+
     def _impl() -> dict[str, Any]:
         _require_dm()
         client, acct = auth.client_for(account)
@@ -1182,8 +1736,13 @@ def get_messages(conversation_id: str, account: str | None = None, *, limit: int
         lim = V.validate_limit(limit, ceiling=CEIL_MESSAGES, all_ceiling=CEIL_MESSAGES)
         pclient, _ = _page_dm_client(client, acct)
         res = pclient.get(cid, fields="messages.limit(" + str(lim) + "){" + MESSAGE_FIELDS + "}")
-        return {"ok": True, "account": acct.label, "conversation_id": cid,
-                "messages": ((res.get("messages") or {}).get("data") or [])[:lim]}
+        return {
+            "ok": True,
+            "account": acct.label,
+            "conversation_id": cid,
+            "messages": ((res.get("messages") or {}).get("data") or [])[:lim],
+        }
+
     return _guard("get_messages", {"conversation_id": conversation_id, "account": account, "limit": limit}, _impl)
 
 
@@ -1191,19 +1750,38 @@ MESSAGE_FIELDS = "id,created_time,from,to,message,attachments,shares,story,react
 DM_TEXT_MAX = 1000
 DM_TAGS = frozenset({"HUMAN_AGENT"})
 SENDER_ACTIONS = frozenset({"mark_seen", "typing_on", "typing_off"})
-OUTSIDE_WINDOW_HINT = ("Instagram only allows replies within 24 hours of the customer's last message. "
-                       "Up to 7 days, a human-written reply can be sent with tag=\"HUMAN_AGENT\" "
-                       "(requires the human_agent permission from Meta App Review).")
+OUTSIDE_WINDOW_HINT = (
+    "Instagram only allows replies within 24 hours of the customer's last message. "
+    'Up to 7 days, a human-written reply can be sent with tag="HUMAN_AGENT" '
+    "(requires the human_agent permission from Meta App Review)."
+)
 
 
 def _is_outside_window(exc: graph_client.GraphAPIError) -> bool:
     msg = str(exc).lower()
-    return exc.subcode in {2534022, 2018278} or "outside of allowed window" in msg or "outside the allowed window" in msg
+    return (
+        exc.subcode in {2534022, 2018278} or "outside of allowed window" in msg or "outside the allowed window" in msg
+    )
 
 
-@mcp.tool()
-def send_message(recipient_id: str, text: str | None = None, account: str | None = None, *,
-                 image_url: str | None = None, tag: str | None = None) -> dict[str, Any]:
+@mcp.tool(
+    annotations={"title": "Send DM reply", "readOnlyHint": False, "openWorldHint": True, "destructiveHint": False}
+)
+def send_message(
+    recipient_id: RecipientIdArg,
+    text: Annotated[
+        str | None, Field(description="Message text (up to 1000 characters). Pass text, image_url, or both.")
+    ] = None,
+    account: AccountArg = None,
+    *,
+    image_url: Annotated[
+        str | None, Field(description="Public https URL of an image to send (sent after the text when both are given).")
+    ] = None,
+    tag: Annotated[
+        Literal["HUMAN_AGENT"] | None,
+        Field(description="HUMAN_AGENT only for a human-written reply 24 h-7 days after the customer's last message."),
+    ] = None,
+) -> dict[str, Any]:
     """Send a DM reply. REQUIRES Meta App Review; only to people who messaged first.
 
     recipient_id: the customer's id (participant "id" from list_conversations, or
@@ -1212,8 +1790,10 @@ def send_message(recipient_id: str, text: str | None = None, account: str | None
     message no tag is needed; up to 7 days later pass tag="HUMAN_AGENT" for a
     human-written reply (needs the human_agent permission).
     """
+
     def _impl() -> dict[str, Any]:
         import json
+
         _require_dm()
         client, acct = auth.client_for(account)
         rid = V.validate_graph_id(recipient_id, field="recipient_id")
@@ -1234,35 +1814,82 @@ def send_message(recipient_id: str, text: str | None = None, account: str | None
         results = []
         for body in bodies:
             try:
-                results.append(pclient.post(f"{page_id}/messages", recipient=json.dumps({"id": rid}),
-                                            message=json.dumps(body, ensure_ascii=False), **routing))
+                results.append(
+                    pclient.post(
+                        f"{page_id}/messages",
+                        recipient=json.dumps({"id": rid}),
+                        message=json.dumps(body, ensure_ascii=False),
+                        **routing,
+                    )
+                )
             except Exception as exc:  # noqa: BLE001 - re-raised with what was already sent
-                sent = {"sent_before_error": len(results),
-                        "message_ids": [r.get("message_id") for r in results]}
+                sent = {"sent_before_error": len(results), "message_ids": [r.get("message_id") for r in results]}
                 if isinstance(exc, graph_client.GraphAPIError) and _is_outside_window(exc):
-                    raise graph_client.GraphAPIError(str(exc), error_class="outside_window",
-                                                     code=exc.code, subcode=exc.subcode,
-                                                     extra={"hint": OUTSIDE_WINDOW_HINT, **sent}) from exc
+                    raise graph_client.GraphAPIError(
+                        str(exc),
+                        error_class="outside_window",
+                        code=exc.code,
+                        subcode=exc.subcode,
+                        extra={"hint": OUTSIDE_WINDOW_HINT, **sent},
+                    ) from exc
                 if not results:
                     raise
                 raise graph_client.GraphAPIError(
-                    audit.sanitize_error(str(exc)), error_class=audit.classify_error(exc),
-                    extra={**sent, "hint": f"{len(results)} message(s) were already delivered; do not "
-                                           "resend those, only retry the part that failed."}) from exc
-        return {"ok": True, "account": acct.label, "recipient_id": rid, "tag": tag,
-                "message_ids": [r.get("message_id") for r in results], "result": results[-1]}
-    return _guard("send_message", {"recipient_id": recipient_id, "text": V.truncate(text or ""),
-                                   "image_url": image_url, "tag": tag, "account": account}, _impl)
+                    audit.sanitize_error(str(exc)),
+                    error_class=audit.classify_error(exc),
+                    extra={
+                        **sent,
+                        "hint": f"{len(results)} message(s) were already delivered; do not "
+                        "resend those, only retry the part that failed.",
+                    },
+                ) from exc
+        return {
+            "ok": True,
+            "account": acct.label,
+            "recipient_id": rid,
+            "tag": tag,
+            "message_ids": [r.get("message_id") for r in results],
+            "result": results[-1],
+        }
+
+    return _guard(
+        "send_message",
+        {
+            "recipient_id": recipient_id,
+            "text": V.truncate(text or ""),
+            "image_url": image_url,
+            "tag": tag,
+            "account": account,
+        },
+        _impl,
+    )
 
 
-@mcp.tool()
-def mark_seen(recipient_id: str, account: str | None = None, *, action: str = "mark_seen") -> dict[str, Any]:
+@mcp.tool(
+    annotations={
+        "title": "Mark DM seen / typing",
+        "readOnlyHint": False,
+        "openWorldHint": True,
+        "destructiveHint": False,
+    }
+)
+def mark_seen(
+    recipient_id: RecipientIdArg,
+    account: AccountArg = None,
+    *,
+    action: Annotated[
+        Literal["mark_seen", "typing_on", "typing_off"],
+        Field(description="mark_seen marks the chat as read; typing_on/typing_off show or hide the typing indicator."),
+    ] = "mark_seen",
+) -> dict[str, Any]:
     """Mark a customer's conversation as seen, or show a typing indicator.
 
     action: mark_seen (default) | typing_on | typing_off. REQUIRES Meta App Review.
     """
+
     def _impl() -> dict[str, Any]:
         import json
+
         _require_dm()
         client, acct = auth.client_for(account)
         rid = V.validate_graph_id(recipient_id, field="recipient_id")
@@ -1270,6 +1897,7 @@ def mark_seen(recipient_id: str, account: str | None = None, *, action: str = "m
         pclient, page_id = _page_dm_client(client, acct)
         res = pclient.post(f"{page_id}/messages", recipient=json.dumps({"id": rid}), sender_action=act)
         return {"ok": True, "account": acct.label, "recipient_id": rid, "action": act, "result": res}
+
     return _guard("mark_seen", {"recipient_id": recipient_id, "action": action, "account": account}, _impl)
 
 
