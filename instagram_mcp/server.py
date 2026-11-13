@@ -2159,6 +2159,13 @@ def list_conversations(
                     exc = _rewrap(exc, error_class="dev_mode_limit")
                     exc.extra["hint"] = graph_client.ERROR_HINTS_BY_SUBCODE[2534084]
                 if first:
+                    if exc.error_class in {"upstream_error", "timeout"} and not (exc.extra or {}).get("hint"):
+                        exc.extra = {
+                            **(exc.extra or {}),
+                            "hint": "Likely cause: Meta's development mode, where a large inbox makes "
+                            "conversation listing fail (timeouts, 'reduce data' or 'unknown error'). Pass "
+                            "user_id for one person's conversation, or wait for App Review approval.",
+                        }
                     raise exc from None
                 nxt = cursor  # resume from the page that failed
                 note = (

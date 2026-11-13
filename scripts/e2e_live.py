@@ -90,7 +90,9 @@ def keychain_token(label: str) -> str:
 def phase_read(m: MCP, ctx: dict[str, Any]) -> None:
     P = "read"
     m.call(P, "healthcheck", {}, lambda d: f"{d['live_check']['username']} {d['graph_version']} usage={d.get('api_usage', {}).get('max_percent')}%")
-    m.call(P, "list_accounts", {}, lambda d: f"{len(d['accounts'])} account(s)")
+    accts = m.call(P, "list_accounts", {}, lambda d: f"{len(d['accounts'])} account(s)")
+    default = next((x for x in accts.get("accounts", []) if x.get("default")), {})
+    ctx["account_label"], ctx["ig_user_id"] = default.get("label"), default.get("ig_user_id")
     prof = m.call(P, "get_profile", {}, lambda d: f"media_count={d['profile']['media_count']}")
     ctx["username"] = (prof.get("profile") or {}).get("username")
     allm = m.call(P, "list_media", {"limit": "all"}, lambda d: f"{d['count']} posts")
@@ -153,14 +155,15 @@ def phase_read(m: MCP, ctx: dict[str, Any]) -> None:
     m.call(P, "get_messages", {"conversation_id": "../me"}, expect_ok=False)
 
 
-def phase_local(binary: str, base_env: dict[str, str], ig_id: str) -> None:
+def phase_local(binary: str, base_env: dict[str, str], ig_id: str, source_label: str) -> None:
     P = "local"
     with tempfile.TemporaryDirectory() as tmp:
-        env = dict(base_env, INSTAGRAM_MCP_ACCOUNTS_PATH=os.path.join(tmp, "accounts.json"))
+        env = dict(base_env, INSTAGRAM_MCP_ACCOUNTS_PATH=os.path.join(tmp, "accounts.json"),
+                   INSTAGRAM_MCP_AUDIT_PATH=os.path.join(tmp, "audit.log.jsonl"))
         m = MCP(binary, env)
-        label = "e2e-temp"
+        label = f"e2e-temp-{os.getpid()}"
         try:
-            m.call(P, "add_account", {"label": label, "access_token": keychain_token("vivefit"),
+            m.call(P, "add_account", {"label": label, "access_token": keychain_token(source_label),
                                       "ig_user_id": ig_id, "make_default": False}, lambda d: "stored")
             m.call(P, "set_default_account", {"label": label}, lambda d: "default set")
             m.call(P, "list_accounts", {}, lambda d: f"default={[a['label'] for a in d['accounts'] if a.get('default')]}")
@@ -198,24 +201,46 @@ def phase_prepare(m: MCP, ctx: dict[str, Any]) -> None:
     m.call(P, "publish_image", {"image_url": img, "caption": " ".join(f"#t{i}" for i in range(31)),
                                 "prepare_only": True}, expect_ok=False)
     m.call(P, "publish_container", {"container_id": "1"}, expect_ok=False)
-    m.call(P, "publish_image", {"image_url": img, "user_tags": [{"username": "bnancore", "x": 0.1, "y": 0.1}],
-                                "prepare_only": True}, expect_ok=False)
+    if ctx.get("untaggable_user"):
+        m.call(P, "publish_image", {"image_url": img, "prepare_only": True,
+                                    "user_tags": [{"username": ctx["untaggable_user"], "x": 0.1, "y": 0.1}]},
+               expect_ok=False)
     cdn_vid = (ctx.get("reel") or {}).get("media_url")
     if cdn_vid:
         m.call(P, "publish_reel", {"video_url": cdn_vid, "prepare_only": True}, expect_ok=False)
 
 
+def pick_own_comment(comments: list[dict[str, Any]], username: str | None) -> str | None:
+    """Id of a comment or reply written by the account itself (never a customer's)."""
+    if not username:
+        return None
+    for c in comments:
+        if c.get("username") == username:
+            return c.get("id")
+    for c in comments:
+        for r in c.get("replies") or []:
+            if r.get("username") == username:
+                return r.get("id")
+    return None
+
+
 def phase_comments(m: MCP, ctx: dict[str, Any]) -> None:
+    """Reply under the account's OWN comment only (no customer gets a notification),
+    then hide, unhide and delete that reply."""
     P = "comments"
-    own = next((x for x in ctx.get("media", []) if x.get("comments_count", 0) >= 0), None)
-    c = m.call(P, "get_comments", {"media_id": own["id"], "limit": 5}, lambda d: f"{d['count']}")
-    target = (c.get("comments") or [None])[0]
+    target = None
+    for post in [x for x in ctx.get("media", []) if x.get("comments_count")][:20]:
+        c = m.call(P, "get_comments", {"media_id": post["id"], "limit": 50, "include_replies": True},
+                   lambda d: f"{d['count']} comments")
+        target = pick_own_comment(c.get("comments") or [], ctx.get("username"))
+        if target:
+            break
     if not target:
-        RESULTS.append((P, "target comment", False, "no comment to reply to", 0))
+        print("comments phase skipped: no comment written by the account itself in the last 20 posts")
         return
-    r = m.call(P, "reply_to_comment", {"comment_id": target["id"], "message": "Test, will be removed."},
-               lambda d: f"reply {d.get('comment_id') or d.get('id')}")
-    rid = r.get("comment_id") or r.get("id") or (r.get("result") or {}).get("id")
+    r = m.call(P, "reply_to_comment", {"comment_id": target, "message": "Test, will be removed."},
+               lambda d: f"reply {d.get('comment_id')}")
+    rid = r.get("comment_id")
     if rid:
         m.call(P, "hide_comment", {"comment_id": rid, "hide": True}, lambda d: "hidden")
         m.call(P, "hide_comment", {"comment_id": rid, "hide": False}, lambda d: "unhidden")
@@ -248,14 +273,17 @@ def phase_publish(m: MCP, ctx: dict[str, Any]) -> None:
     m.call("publish", "publish_container", {"container_id": cid}, lambda d: f"published media {d['media_id']}")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", required=True)
     ap.add_argument("--phases", default="read,local,prepare")
-    ap.add_argument("--dm-to", default="bnancore")
+    ap.add_argument("--dm-to", help="username to send the test DMs to (required for the dm phase)")
+    ap.add_argument("--untaggable-user", help="a private username, to check the tagging error hint")
     ap.add_argument("--approve", action="store_true", help="allow public comment + DM phases")
     ap.add_argument("--approve-publish", action="store_true", help="allow REAL publishing of a story")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
+    if "dm" in a.phases.split(",") and not a.dm_to:
+        sys.exit("the dm phase needs --dm-to <username>")
     phases = a.phases.split(",")
     if {"comments", "dm"} & set(phases) and not a.approve:
         sys.exit("comments/dm phases need --approve")
@@ -263,12 +291,12 @@ def main() -> int:
         sys.exit("publish phase needs --approve-publish")
     env = dict(os.environ, INSTAGRAM_MCP_DM_ENABLED="1")
     m = MCP(a.server, env)
-    ctx: dict[str, Any] = {}
+    ctx: dict[str, Any] = {"untaggable_user": a.untaggable_user}
     print(f"tools exposed: {len(m.tools)}")
     try:
         phase_read(m, ctx)  # always: other phases need its context
         if "local" in phases:
-            phase_local(a.server, env, "17841401555704149")
+            phase_local(a.server, env, ctx["ig_user_id"], ctx["account_label"])
         if "prepare" in phases or "publish" in phases:
             phase_prepare(m, ctx)
         if "comments" in phases:
