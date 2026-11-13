@@ -711,16 +711,18 @@ def list_media(
         start_dt = V.validate_date(since, field="since")
         end_dt = V.validate_date(until, field="until", end_of_day=True)
         resume = V.parse_until_cursor(cur)
-        resume_epoch, resume_id = resume if resume else (None, None)
+        resume_epoch, resume_ids = resume if resume else (None, None)
+        seen_same_second = set(resume_ids.split("_")) if resume_ids else set()
         if resume is not None:
-            # synthetic cursor from a date-filtered page: continue right after the last post
-            # returned (posts in the same second are resumed by id, so none is lost)
+            # synthetic cursor from a date-filtered page: continue with the posts not yet
+            # returned. Posts in the boundary second are tracked by id, so a deleted post or
+            # several posts in one second never cause losses or repeats.
             from datetime import datetime, timezone
 
-            resume_dt = datetime.fromtimestamp(resume_epoch, timezone.utc)
+            # old-format cursor (no ids): strictly older than that second
+            resume_dt = datetime.fromtimestamp(resume_epoch - (0 if resume_ids else 1), timezone.utc)
             end_dt = min(end_dt, resume_dt) if end_dt else resume_dt
             cur = None
-        passed_last = {"done": resume_id is None}
         if start_dt and end_dt and start_dt > end_dt:
             raise V.ValidationError("since must be on or before until")
 
@@ -735,11 +737,10 @@ def list_media(
             when = V.parse_graph_time(ts)
             if when > end_dt:
                 return True
-            if resume_epoch is not None and int(when.timestamp()) == resume_epoch and not passed_last["done"]:
-                if item.get("id") == resume_id:
-                    passed_last["done"] = True
-                return True  # same second as the last post returned: skip up to and including it
-            return False
+            # skip posts of the boundary second that an earlier page already returned
+            return bool(
+                resume_ids and int(when.timestamp()) == resume_epoch and str(item.get("id")) in seen_same_second
+            )
 
         items, cursor = client.paginate(
             f"{acct.ig_user_id}/media",
@@ -754,9 +755,12 @@ def list_media(
         if getattr(client, "last_cut", False) and items:
             # A Graph cursor cannot resume mid-page, so hand out a synthetic one that
             # continues just before the last returned post (same filters).
-            last = items[-1]
-            epoch = int(V.parse_graph_time(last["timestamp"]).timestamp())
-            return _paged({"ok": True, "account": acct.label}, items, f"until-{epoch}-{last['id']}", "media")
+            epoch = int(V.parse_graph_time(items[-1]["timestamp"]).timestamp())
+            same = [str(m["id"]) for m in items if int(V.parse_graph_time(m["timestamp"]).timestamp()) == epoch]
+            if resume_ids and epoch == resume_epoch:
+                same = sorted(seen_same_second) + same  # boundary second spans several pages
+            ids = "_".join(list(dict.fromkeys(same))[-20:])  # cursor holds at most 20 ids
+            return _paged({"ok": True, "account": acct.label}, items, f"until-{epoch}-{ids}", "media")
         return _paged({"ok": True, "account": acct.label}, items, cursor, "media")
 
     return _guard("list_media", {"account": account, "limit": limit, "since": since, "until": until}, _impl)
