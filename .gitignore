@@ -20,4 +20,3 @@ audit.log.jsonl
 # Build
 dist/
 build/
-uv.lock
