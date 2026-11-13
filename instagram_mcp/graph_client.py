@@ -40,6 +40,7 @@ MAX_RETRY_AFTER_S = 60.0
 # Meta "too many calls" codes: the request was rejected unprocessed, so even a POST
 # can be retried safely. (4 app, 17 user, 32 page, 613 custom, 80002 Instagram BUC.)
 THROTTLE_CODES = frozenset({4, 17, 32, 613, 80002})
+TOKEN_ERROR_CODES = frozenset({190, 102, 463, 467})  # invalid / expired / session errors
 
 _sleep = time.sleep  # patched in tests
 
@@ -128,15 +129,21 @@ def assert_safe_host(url: str) -> str:
 
 def _map_graph_error(payload: dict[str, Any], http_status: int) -> GraphAPIError:
     """Translate a Graph API error envelope into a typed GraphAPIError."""
-    err = payload.get("error", {}) if isinstance(payload, dict) else {}
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(err, dict):
+        err = {}
     message = err.get("message") or f"Graph API error (HTTP {http_status})"
     code = err.get("code")
     subcode = err.get("error_subcode")
     etype = err.get("type")
 
     error_class = "upstream_error"
-    if code == 190 or etype == "OAuthException":
+    # Meta tags many non-token errors (e.g. "media not ready") with type OAuthException,
+    # so only the real token codes mean "re-authenticate".
+    if code in TOKEN_ERROR_CODES:
         error_class = "oauth"
+    if code == 9007:
+        error_class = "not_ready"
     if code in THROTTLE_CODES or (isinstance(message, str) and "rate limit" in message.lower()):
         error_class = "rate_limited"
     if code in {10, 200, 803} or (isinstance(code, int) and 200 <= code <= 299):
@@ -205,9 +212,12 @@ def _backoff(attempt: int) -> float:
 def _retry_after(headers: Any) -> float | None:
     raw = headers.get("Retry-After") if headers is not None else None
     try:
-        return min(float(raw), MAX_RETRY_AFTER_S) if raw is not None else None
+        value = float(raw) if raw is not None else None
     except (TypeError, ValueError):
         return None
+    if value is None or value != value or value < 0 or value == float("inf"):  # NaN, negative, inf
+        return None
+    return min(value, MAX_RETRY_AFTER_S)
 
 
 def _pct_max(values: Any) -> float:
@@ -339,6 +349,12 @@ class GraphClient:
             try:
                 body = resp.json()
             except ValueError:
+                if resp.status_code < 400:
+                    raise GraphAPIError(
+                        f"Meta returned a non-JSON response (HTTP {resp.status_code}); the result is unknown",
+                        error_class="upstream_error",
+                        http_status=resp.status_code,
+                    ) from None
                 body = {}
             if resp.status_code >= 400 or (isinstance(body, dict) and "error" in body):
                 err = _map_graph_error(body if isinstance(body, dict) else {}, resp.status_code)
@@ -393,6 +409,9 @@ class GraphClient:
             data = page.get("data") or []
             for item in data:
                 if stop is not None and stop(item):
+                    if len(out) > max_items:  # stop can fire after a full page was skipped into
+                        self.last_cut = True
+                        return out[:max_items], None
                     return out, None
                 if skip is not None and skip(item):
                     continue
