@@ -237,8 +237,7 @@ def test_account_info_removed():
 def test_healthcheck_reports_features(dm_account):
     from instagram_mcp import server
     dm_account.route("GET", rf"^/{FAKE_IG_ID}$", {"id": FAKE_IG_ID, "username": "demo"})
-    dm_account.route("GET", r"^/debug_token$", {"data": {"is_valid": True, "scopes": ["instagram_basic"],
-                                                         "data_access_expires_at": 1802186656}})
+    dm_account.route("GET", r"^/me/permissions$", {"data": [{"permission": "instagram_basic", "status": "granted"}]})
     dm_account.route("GET", rf"^/{FAKE_PAGE_ID}/conversations$", (400, {"error": {
         "message": "Timeout", "code": -2, "error_subcode": 2534084}}))
     call(server.list_conversations)()
@@ -247,7 +246,7 @@ def test_healthcheck_reports_features(dm_account):
     assert f["dm"]["status"] == "dev_mode_limit"
     assert "development" in f["app_mode"]
     assert "Public Content Access" in f["hashtag_search"]
-    assert res["token"]["scopes"] == ["instagram_basic"] and res["token"]["data_access_expires"] == "2027-02-09"
+    assert res["token"]["scopes"] == ["instagram_basic"]
 
 
 def test_blocked_features_are_described_upfront():

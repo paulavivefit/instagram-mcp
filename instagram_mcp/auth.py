@@ -281,7 +281,7 @@ def remove_account(label: str) -> dict[str, Any]:
     if meta.get("default") == label:
         # keep a default only when it is unambiguous (exactly one account left)
         remaining = list(meta["accounts"])
-        meta["default"] = remaining[0] if len(remaining) == 1 else None
+        meta["default"] = remaining[0] if len(remaining) == 1 and not os.environ.get(ENV_TOKEN) else None
     _save_meta(meta)
     return {"label": label, "removed": existed, "default": meta.get("default")}
 

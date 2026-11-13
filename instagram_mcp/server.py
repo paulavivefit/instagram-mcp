@@ -312,7 +312,18 @@ PUBLISH_LATER_HINT = (
 )
 
 
-MAX_VIDEO_POLLS = 15
+MAX_VIDEO_POLLS = 15  # at the default 300 s wait
+
+
+def _max_polls() -> int:
+    """Enough polls to cover VIDEO_WAIT_S with the backoff schedule (at least 15)."""
+    n, total = 0, 0
+    while total < VIDEO_WAIT_S:
+        total += _poll_delay(n)
+        n += 1
+    return max(MAX_VIDEO_POLLS, n)
+
+
 POLL_BACKOFF_S = (5, 10, 20, 30)  # then 30 s per poll
 
 
@@ -348,7 +359,7 @@ def _wait_container_ready(client: graph_client.GraphClient, container_id: str, *
     """
     wait = VIDEO_WAIT_S if timeout_s is None else timeout_s
     start = _monotonic()
-    for n in range(MAX_VIDEO_POLLS):
+    for n in range(_max_polls()):
         try:
             status = client.get(container_id, fields="status_code,status")
         except graph_client.GraphAPIError as exc:
@@ -356,7 +367,7 @@ def _wait_container_ready(client: graph_client.GraphClient, container_id: str, *
         if _check_status(container_id, status):
             return
         delay = _poll_delay(n)
-        if n == MAX_VIDEO_POLLS - 1 or _monotonic() - start + delay > wait:
+        if n == _max_polls() - 1 or _monotonic() - start + delay > wait:
             raise _not_ready_error(container_id, status.get("status_code"), _monotonic() - start)
         time.sleep(delay)
 
@@ -369,7 +380,7 @@ def _wait_containers_ready(client: graph_client.GraphClient, container_ids: list
     """
     pending = list(container_ids)
     start = _monotonic()
-    for n in range(MAX_VIDEO_POLLS):
+    for n in range(_max_polls()):
         still = []
         for cid in pending:
             try:
@@ -382,7 +393,7 @@ def _wait_containers_ready(client: graph_client.GraphClient, container_ids: list
         if not pending:
             return
         delay = _poll_delay(n)
-        if n == MAX_VIDEO_POLLS - 1 or _monotonic() - start + delay > VIDEO_WAIT_S:
+        if n == _max_polls() - 1 or _monotonic() - start + delay > VIDEO_WAIT_S:
             raise _not_ready_error(pending[0], "IN_PROGRESS", _monotonic() - start)
         time.sleep(delay)
 
@@ -535,19 +546,13 @@ def _features(dm_enabled: bool) -> dict[str, Any]:
 
 
 def _token_info(client: graph_client.GraphClient, acct: Any) -> dict[str, Any]:
-    from datetime import datetime, timezone
-
+    # me/permissions works with the Authorization header; debug_token would need the token
+    # in the URL (Meta does not accept it as POST), so it is not used.
     try:
-        d = client.get("debug_token", input_token=acct.access_token).get("data") or {}
+        rows = client.get("me/permissions").get("data") or []
     except graph_client.GraphAPIError as exc:
         return {"checked": False, "error": audit.sanitize_error(str(exc))}
-    info: dict[str, Any] = {"valid": d.get("is_valid"), "scopes": d.get("scopes") or []}
-    exp = d.get("data_access_expires_at")
-    if exp:
-        info["data_access_expires"] = datetime.fromtimestamp(exp, timezone.utc).date().isoformat()
-    if d.get("expires_at"):
-        info["expires"] = datetime.fromtimestamp(d["expires_at"], timezone.utc).date().isoformat()
-    return info
+    return {"valid": True, "scopes": [r.get("permission") for r in rows if r.get("status") == "granted"]}
 
 
 @mcp.tool(annotations={"title": "List configured accounts", "readOnlyHint": True, "openWorldHint": True})
@@ -706,13 +711,16 @@ def list_media(
         start_dt = V.validate_date(since, field="since")
         end_dt = V.validate_date(until, field="until", end_of_day=True)
         resume = V.parse_until_cursor(cur)
+        resume_epoch, resume_id = resume if resume else (None, None)
         if resume is not None:
-            # synthetic cursor from a date-filtered page: continue with posts older than it
+            # synthetic cursor from a date-filtered page: continue right after the last post
+            # returned (posts in the same second are resumed by id, so none is lost)
             from datetime import datetime, timezone
 
-            resume_dt = datetime.fromtimestamp(resume - 1, timezone.utc)
+            resume_dt = datetime.fromtimestamp(resume_epoch, timezone.utc)
             end_dt = min(end_dt, resume_dt) if end_dt else resume_dt
             cur = None
+        passed_last = {"done": resume_id is None}
         if start_dt and end_dt and start_dt > end_dt:
             raise V.ValidationError("since must be on or before until")
 
@@ -722,7 +730,16 @@ def list_media(
 
         def too_new(item: dict[str, Any]) -> bool:
             ts = item.get("timestamp")
-            return bool(end_dt and ts and V.parse_graph_time(ts) > end_dt)
+            if not (end_dt and ts):
+                return False
+            when = V.parse_graph_time(ts)
+            if when > end_dt:
+                return True
+            if resume_epoch is not None and int(when.timestamp()) == resume_epoch and not passed_last["done"]:
+                if item.get("id") == resume_id:
+                    passed_last["done"] = True
+                return True  # same second as the last post returned: skip up to and including it
+            return False
 
         items, cursor = client.paginate(
             f"{acct.ig_user_id}/media",
@@ -737,8 +754,9 @@ def list_media(
         if getattr(client, "last_cut", False) and items:
             # A Graph cursor cannot resume mid-page, so hand out a synthetic one that
             # continues just before the last returned post (same filters).
-            last = V.parse_graph_time(items[-1]["timestamp"])
-            return _paged({"ok": True, "account": acct.label}, items, f"until-{int(last.timestamp())}", "media")
+            last = items[-1]
+            epoch = int(V.parse_graph_time(last["timestamp"]).timestamp())
+            return _paged({"ok": True, "account": acct.label}, items, f"until-{epoch}-{last['id']}", "media")
         return _paged({"ok": True, "account": acct.label}, items, cursor, "media")
 
     return _guard("list_media", {"account": account, "limit": limit, "since": since, "until": until}, _impl)
@@ -800,7 +818,9 @@ def _resolve_range(since: str | None, until: str | None, *, allow_old: bool = Fa
         V.validate_date(v, field=field)  # format check (rejects 20261031 etc.)
         if len(v) == 10:
             day = SH.pacific_midnight(v)
-            return day + timedelta(days=1) if inclusive_end else day
+            if inclusive_end:  # next Pacific midnight by calendar date (DST days are 23/25 h)
+                return SH.pacific_midnight(SH.pacific_today(day) + timedelta(days=1))
+            return day
         if not ("T" in v or " " in v):
             raise V.ValidationError(f"{field} must be YYYY-MM-DD or a full ISO date-time")
         return V.validate_date(v, field=field)
@@ -908,12 +928,15 @@ def _account_insights_range(
                 window_totals.append(clean)
                 unavailable.update(bad)
     if "follower_count" in ts:
-        today = SH.pacific_midnight(SH.pacific_today(_utcnow()))
-        f_start, f_end = max(start, today - timedelta(days=30)), min(end, today)
+        today_date = SH.pacific_today(_utcnow())
+        today = SH.pacific_midnight(today_date)
+        first_day = SH.pacific_midnight(today_date - timedelta(days=30))  # exactly 30 Pacific days
+        f_start, f_end = max(start, first_day), min(end, today)
         if f_start < f_end:
-            for row in fetch({"metric": "follower_count", "period": "day"}, ["follower_count"], (f_start, f_end)) or []:
-                series.setdefault("follower_count", []).extend(SH.flatten_series(row.get("values")))
-        if start < today - timedelta(days=30) or f_start >= f_end:
+            for win in _windows(f_start, f_end):  # 30 Pacific days can exceed Meta's limit across DST
+                for row in fetch({"metric": "follower_count", "period": "day"}, ["follower_count"], win) or []:
+                    series.setdefault("follower_count", []).extend(SH.flatten_series(row.get("values")))
+        if start < first_day or f_start >= f_end:
             notes.append(
                 "follower_count is only available for the last 30 days (excluding today); older days were skipped."
             )
@@ -2371,14 +2394,16 @@ def send_message(
                     ) from exc
                 if not results:
                     raise _dm_permission_hint(exc) from None
+                uncertain = bool(getattr(exc, "extra", {}) and exc.extra.get("uncertain"))
+                hint = f"{len(results)} message(s) were already delivered; do not resend those. " + (
+                    graph_client.UNCERTAIN_WRITE_HINT
+                    if uncertain
+                    else "The next part failed and was not sent; retry only that part."
+                )
                 raise graph_client.GraphAPIError(
                     audit.sanitize_error(str(exc)),
                     error_class=audit.classify_error(exc),
-                    extra={
-                        **sent,
-                        "hint": f"{len(results)} message(s) were already delivered; do not "
-                        "resend those, only retry the part that failed.",
-                    },
+                    extra={**sent, "hint": hint},
                 ) from exc
         return {
             "ok": True,

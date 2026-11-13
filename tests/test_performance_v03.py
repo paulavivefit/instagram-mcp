@@ -148,7 +148,7 @@ def test_video_poll_cap(account, monkeypatch):
     res = call(server.publish_reel)("https://cdn.example.com/v.mp4", prepare_only=True)
     assert res["error_class"] == "timeout"
     polls = len(account.calls("GET", r"^/C1$"))
-    assert polls <= server.MAX_VIDEO_POLLS == 15
+    assert polls == server._max_polls()  # bounded, and scaled to the configured wait
 
 
 # B5: top_posts caps insight lookups
