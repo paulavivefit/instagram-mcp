@@ -268,11 +268,13 @@ def validate_cursor(value: str | None, *, field: str = "after") -> str | None:
     return value.strip()
 
 
-_UNTIL_CURSOR_RE = re.compile(r"^until-(\d{9,11})(?:-(\d{1,30}))?$")
+_UNTIL_CURSOR_RE = re.compile(r"^until-(\d{9,11})(?:-(\d{1,30}(?:_\d{1,30}){0,19}))?$")
 
 
 def parse_until_cursor(value: str | None) -> tuple[int, str | None] | None:
-    """(epoch, last_id) from a synthetic 'until-<epoch>[-<id>]' cursor, else None."""
+    """(epoch, ids) from a synthetic 'until-<epoch>[-<id>_<id>...]' cursor, else None.
+
+    ids are the posts in that same second that were already returned ("_"-joined)."""
     m = _UNTIL_CURSOR_RE.match(value or "")
     return (int(m.group(1)), m.group(2)) if m else None
 

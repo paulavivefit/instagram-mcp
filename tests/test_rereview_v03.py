@@ -119,3 +119,43 @@ def test_poll_cap_scales_with_configured_wait(monkeypatch):
     assert sum(server._poll_delay(n) for n in range(server._max_polls())) >= 1800
     monkeypatch.setattr(server, "VIDEO_WAIT_S", 300)
     assert server._max_polls() == 15
+
+
+def _walk(server, until, limit, first_cursor=None):
+    seen, cur = [], first_cursor
+    for _ in range(20):
+        r = call(server.list_media)(limit=limit, until=until, after=cur)
+        seen += [m["id"] for m in r["media"]]
+        cur = r.get("next_cursor")
+        if not cur:
+            break
+    return seen
+
+
+# A. the cursor's own post deleted before the next call: same-second siblings are not lost
+def test_cursor_post_deleted_keeps_same_second_siblings(account):
+    from instagram_mcp import server
+    ts = "2026-11-10T10:00:00+0000"
+    epoch = int(datetime(2026, 11, 10, 10, tzinfo=timezone.utc).timestamp())
+    feed = [{"id": "12", "timestamp": ts}, {"id": "13", "timestamp": ts}, {"id": "2", "timestamp": "2026-11-09T10:00:00+0000"}]
+    account.route("GET", rf"^/{FAKE_IG_ID}/media$", {"data": feed})  # post 11 was deleted
+    assert _walk(server, "2026-11-11", 5, first_cursor=f"until-{epoch}-11") == ["12", "13", "2"]
+
+
+# B. an old-format cursor (no id) does not repeat the last post
+def test_old_format_cursor_does_not_repeat(account):
+    from instagram_mcp import server
+    ts = "2026-11-10T10:00:00+0000"
+    epoch = int(datetime(2026, 11, 10, 10, tzinfo=timezone.utc).timestamp())
+    feed = [{"id": "11", "timestamp": ts}, {"id": "2", "timestamp": "2026-11-09T10:00:00+0000"}]
+    account.route("GET", rf"^/{FAKE_IG_ID}/media$", {"data": feed})
+    assert _walk(server, "2026-11-11", 5, first_cursor=f"until-{epoch}") == ["2"]
+
+
+def test_three_same_second_posts_across_pages(account):
+    from instagram_mcp import server
+    ts = "2026-11-10T10:00:00+0000"
+    feed = [{"id": i, "timestamp": ts} for i in ("11", "12", "13")] + [{"id": "2", "timestamp": "2026-11-09T10:00:00+0000"}]
+    account.route("GET", rf"^/{FAKE_IG_ID}/media$", {"data": feed})
+    assert _walk(server, "2026-11-11", 1) == ["11", "12", "13", "2"]
+    assert _walk(server, "2026-11-11", 2) == ["11", "12", "13", "2"]
