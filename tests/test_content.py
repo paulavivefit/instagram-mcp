@@ -15,7 +15,7 @@ def test_get_comments_include_replies_expands_field(account):
     res = call(server.get_comments)("555", include_replies=True)
     assert res["ok"] is True, res
     fields = account.calls("GET", r"^/555/comments$")[0].params["fields"]
-    assert "replies{" in fields
+    assert "replies.limit(" in fields
     assert res["comments"][0]["replies"][0]["id"] == "r1"
     assert res["reply_count"] == 1
 

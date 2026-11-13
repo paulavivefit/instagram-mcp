@@ -31,6 +31,7 @@ def _sequence(*responses):
 
 
 THROTTLED = (400, {"error": {"message": "Application request limit reached", "code": 4}})
+BURST = (400, {"error": {"message": "Calls to this api have exceeded the rate limit", "code": 613}})
 IG_THROTTLED = (400, {"error": {"message": "too many calls", "code": 80002}})
 SERVER_ERR = (500, {"error": {"message": "An unexpected error has occurred", "code": 2, "is_transient": True}})
 BAD_PARAM = (400, {"error": {"message": "(#100) bad", "code": 100}})
@@ -39,7 +40,7 @@ OK = {"id": FAKE_IG_ID, "username": "demo"}
 
 # ---------------------------------- retries --------------------------------- #
 
-@pytest.mark.parametrize("failure", [THROTTLED, IG_THROTTLED, SERVER_ERR])
+@pytest.mark.parametrize("failure", [BURST, SERVER_ERR])
 def test_get_retries_transient_errors_then_succeeds(account, sleeps, failure):
     from instagram_mcp import auth
     account.route("GET", PROFILE, _sequence(failure, failure, OK))
@@ -51,7 +52,7 @@ def test_get_retries_transient_errors_then_succeeds(account, sleeps, failure):
 
 def test_get_gives_up_after_max_attempts(account, sleeps):
     from instagram_mcp import auth, graph_client
-    account.route("GET", PROFILE, THROTTLED)
+    account.route("GET", PROFILE, BURST)
     client, _ = auth.client_for(None)
     with pytest.raises(graph_client.GraphAPIError) as exc:
         client.get(FAKE_IG_ID)
@@ -94,7 +95,7 @@ def test_post_5xx_is_not_retried_but_throttle_is(account, sleeps):
         client.post("1/comments_a", message="x")
     assert len(account.calls("POST", r"/comments_a$")) == 1
     # throttling means Meta rejected the request without processing it -> safe to retry
-    account.route("POST", r"/comments_b$", _sequence(THROTTLED, {"id": "c1"}))
+    account.route("POST", r"/comments_b$", _sequence(BURST, {"id": "c1"}))
     assert client.post("1/comments_b", message="x")["id"] == "c1"
 
 

@@ -106,7 +106,8 @@ MEDIA_FIELDS = (
     "thumbnail_url,timestamp,username,like_count,comments_count"
 )
 COMMENT_FIELDS = "id,text,username,timestamp,like_count,hidden"
-COMMENT_WITH_REPLIES_FIELDS = COMMENT_FIELDS + ",replies{" + COMMENT_FIELDS + "}"
+REPLIES_PAGE = 50
+COMMENT_WITH_REPLIES_FIELDS = COMMENT_FIELDS + f",replies.limit({REPLIES_PAGE}){{" + COMMENT_FIELDS + "}"
 CHILD_FIELDS = "children{id,media_type,media_url,thumbnail_url,permalink,timestamp}"
 STORY_FIELDS = "id,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp,caption"
 
@@ -178,6 +179,7 @@ def _guard(tool: str, input_payload: dict[str, Any], impl: Any) -> dict[str, Any
         )
         if error_class == "oauth":
             _PAGE_CACHE.clear()  # a revoked/expired token must not stay cached
+            auth.clear_cache()
         out = {"ok": False, "error": message, "error_class": error_class}
         for attr in ("code", "subcode"):
             if isinstance(getattr(exc, attr, None), int):
@@ -199,9 +201,30 @@ CEIL_MEDIA, CEIL_COMMENTS, CEIL_DISCOVERY, CEIL_TAGS, CEIL_CONVERSATIONS, CEIL_M
     5000,
     500,
     1000,
-    200,
+    50,
     100,
 )
+USAGE_REFUSE_PERCENT = 80  # refuse limit="all" walks above this share of Meta's hourly quota
+DM_LIST_TIMEOUT_S = 45.0  # one attempt per conversation page (dev mode can hang)
+DM_LIST_BUDGET_S = 90.0  # total time budget for one list_conversations call
+TOP_POSTS_INSIGHT_CAP = 150  # posts whose insights top_posts fetches (each counts as a call)
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+def _check_budget(limit: Any) -> None:
+    """Refuse a full walk when Meta's reported usage is already high (it would only fail midway)."""
+    if not (isinstance(limit, str) and limit.strip().lower() == "all"):
+        return
+    pct = graph_client.LAST_USAGE.get("max_percent")
+    if isinstance(pct, (int, float)) and pct >= USAGE_REFUSE_PERCENT:
+        raise graph_client.GraphAPIError(
+            f'Meta reports {pct}% of the hourly API quota used; a limit="all" walk would likely be cut off.',
+            error_class="rate_limited",
+            extra={"hint": "Use a smaller limit or since/until, or try again within the hour."},
+        )
 
 
 def _paged(out: dict[str, Any], items: list[dict[str, Any]], cursor: str | None, key: str) -> dict[str, Any]:
@@ -253,35 +276,79 @@ PUBLISH_LATER_HINT = (
 )
 
 
-def _wait_container_ready(
-    client: graph_client.GraphClient, container_id: str, *, timeout_s: int | None = None, interval_s: int = 5
-) -> None:
-    """Poll a media container until status_code=FINISHED (video/reel/story-video are async).
+MAX_VIDEO_POLLS = 15
+POLL_BACKOFF_S = (5, 10, 20, 30)  # then 30 s per poll
 
-    On timeout raises a GraphAPIError(error_class=timeout) carrying container_id + a hint,
-    so the caller can finish later with publish_container instead of re-uploading.
+
+def _poll_delay(n: int) -> int:
+    return POLL_BACKOFF_S[min(n, len(POLL_BACKOFF_S) - 1)]
+
+
+def _check_status(container_id: str, status: dict[str, Any]) -> bool:
+    """True when ready; raises on ERROR/EXPIRED; False while still processing."""
+    code = status.get("status_code")
+    if code in ("FINISHED", "PUBLISHED"):
+        return True
+    if code == "ERROR":
+        raise _processing_error(container_id, status)
+    if code == "EXPIRED":
+        raise _expired_error(container_id)
+    return False
+
+
+def _not_ready_error(container_id: str, code: Any, waited: float) -> graph_client.GraphAPIError:
+    return graph_client.GraphAPIError(
+        f"media container {container_id} not ready after {int(waited)}s",
+        error_class="timeout",
+        extra={"container_id": container_id, "status_code": code, "hint": PUBLISH_LATER_HINT},
+    )
+
+
+def _wait_container_ready(client: graph_client.GraphClient, container_id: str, *, timeout_s: int | None = None) -> None:
+    """Poll one media container until FINISHED (video/reel/story-video are async).
+
+    Backs off 5, 10, 20, 30 s and stops after MAX_VIDEO_POLLS or VIDEO_WAIT_S. On timeout
+    raises error_class=timeout with container_id, so publish_container can finish later.
     """
     wait = VIDEO_WAIT_S if timeout_s is None else timeout_s
-    deadline = time.monotonic() + wait
-    while True:
+    start = _monotonic()
+    for n in range(MAX_VIDEO_POLLS):
         try:
             status = client.get(container_id, fields="status_code,status")
         except graph_client.GraphAPIError as exc:
             raise _rewrap(exc, container_id=container_id, hint=PUBLISH_LATER_HINT) from exc
-        code = status.get("status_code")
-        if code in ("FINISHED", "PUBLISHED"):
+        if _check_status(container_id, status):
             return
-        if code == "ERROR":
-            raise _processing_error(container_id, status)
-        if code == "EXPIRED":
-            raise _expired_error(container_id)
-        if time.monotonic() + interval_s > deadline:
-            raise graph_client.GraphAPIError(
-                f"media container {container_id} not ready after {wait}s",
-                error_class="timeout",
-                extra={"container_id": container_id, "status_code": code, "hint": PUBLISH_LATER_HINT},
-            )
-        time.sleep(interval_s)
+        delay = _poll_delay(n)
+        if n == MAX_VIDEO_POLLS - 1 or _monotonic() - start + delay > wait:
+            raise _not_ready_error(container_id, status.get("status_code"), _monotonic() - start)
+        time.sleep(delay)
+
+
+def _wait_containers_ready(client: graph_client.GraphClient, container_ids: list[str]) -> None:
+    """Poll several containers with one shared deadline and backoff.
+
+    Meta deprecated the batched ?ids= lookup in Graph v26.0+, so each pending container is
+    checked individually per round; finished ones are dropped from the next round.
+    """
+    pending = list(container_ids)
+    start = _monotonic()
+    for n in range(MAX_VIDEO_POLLS):
+        still = []
+        for cid in pending:
+            try:
+                status = client.get(cid, fields="status_code,status")
+            except graph_client.GraphAPIError as exc:
+                raise _rewrap(exc, container_id=cid) from exc
+            if not _check_status(cid, status):
+                still.append(cid)
+        pending = still
+        if not pending:
+            return
+        delay = _poll_delay(n)
+        if n == MAX_VIDEO_POLLS - 1 or _monotonic() - start + delay > VIDEO_WAIT_S:
+            raise _not_ready_error(pending[0], "IN_PROGRESS", _monotonic() - start)
+        time.sleep(delay)
 
 
 def _rewrap(
@@ -577,6 +644,7 @@ def list_media(
     """
 
     def _impl() -> dict[str, Any]:
+        _check_budget(limit)
         client, acct = auth.client_for(account)
         lim = V.validate_limit(limit, ceiling=CEIL_MEDIA, all_ceiling=CEIL_MEDIA)
         cur = V.validate_cursor(after)
@@ -1070,9 +1138,15 @@ def top_posts(
                 p["metrics"] = {"likes": p.get("like_count"), "comments": p.get("comments_count")}
             ranked = sorted(posts, key=lambda p: p.get(field) or 0, reverse=True)[:top_n]
         else:
-            errors = _batch_media_insights(client, posts)
+            # Each post's insights count as an API call: look up at most TOP_POSTS_INSIGHT_CAP,
+            # choosing candidates by engagement (likes + comments) which every post has.
+            candidates = sorted(
+                posts, key=lambda p: (p.get("like_count") or 0) + (p.get("comments_count") or 0), reverse=True
+            )[:TOP_POSTS_INSIGHT_CAP]
+            ranked_pool = candidates
+            errors = _batch_media_insights(client, ranked_pool)
             ranked = sorted(
-                (p for p in posts if "metrics" in p), key=lambda p: p["metrics"].get(metric) or -1, reverse=True
+                (p for p in ranked_pool if "metrics" in p), key=lambda p: p["metrics"].get(metric) or -1, reverse=True
             )[:top_n]
         result = []
         for p in ranked:
@@ -1095,6 +1169,7 @@ def top_posts(
             "since": SH.pacific_today(start).isoformat(),
             "until": SH.pacific_today(end - timedelta(seconds=1)).isoformat(),
             "posts_considered": len(posts),
+            "posts_ranked": len(posts) if by_count else min(len(posts), TOP_POSTS_INSIGHT_CAP),
             "posts": result,
         }
         if errors:
@@ -1578,25 +1653,25 @@ def publish_carousel(
             else:
                 child = client.post(f"{acct.ig_user_id}/media", image_url=u, is_carousel_item=True)
             child_ids.append(child.get("id"))
-        for vid in video_ids:
-            try:
-                _wait_container_ready(client, vid)
-            except graph_client.GraphAPIError as exc:
-                specific = (exc.extra or {}).get("hint")
-                carousel_hint = (
-                    "A carousel video is still processing (or failed); nothing was published. Run "
-                    "publish_carousel again later (carousel items cannot be published on their own)."
-                )
-                if specific and specific != PUBLISH_LATER_HINT:
-                    carousel_hint = f"{specific} {carousel_hint}"
-                raise graph_client.GraphAPIError(
-                    str(exc),
-                    error_class=exc.error_class,
-                    code=exc.code,
-                    subcode=exc.subcode,
-                    http_status=exc.http_status,
-                    extra={"child_container_ids": child_ids, "hint": carousel_hint},
-                ) from exc
+        try:
+            if video_ids:
+                _wait_containers_ready(client, video_ids)
+        except graph_client.GraphAPIError as exc:
+            specific = (exc.extra or {}).get("hint")
+            carousel_hint = (
+                "A carousel video is still processing (or failed); nothing was published. Run "
+                "publish_carousel again later (carousel items cannot be published on their own)."
+            )
+            if specific and specific != PUBLISH_LATER_HINT:
+                carousel_hint = f"{specific} {carousel_hint}"
+            raise graph_client.GraphAPIError(
+                str(exc),
+                error_class=exc.error_class,
+                code=exc.code,
+                subcode=exc.subcode,
+                http_status=exc.http_status,
+                extra={"child_container_ids": child_ids, "hint": carousel_hint},
+            ) from exc
         parent = client.post(
             f"{acct.ig_user_id}/media",
             media_type="CAROUSEL",
@@ -1674,6 +1749,7 @@ def get_comments(
     """
 
     def _impl() -> dict[str, Any]:
+        _check_budget(limit)
         client, acct = auth.client_for(account)
         mid = V.validate_graph_id(media_id, field="media_id")
         lim = V.validate_limit(limit, ceiling=CEIL_COMMENTS, all_ceiling=CEIL_COMMENTS)
@@ -1684,6 +1760,8 @@ def get_comments(
             for c in items:
                 if isinstance(c.get("replies"), dict):
                     c["replies"] = c["replies"].get("data") or []
+                if len(c.get("replies") or []) >= REPLIES_PAGE:
+                    c["replies_truncated"] = True  # use get_comment_replies for the rest
             out["reply_count"] = sum(len(c.get("replies") or []) for c in items)
         return out
 
@@ -1701,6 +1779,7 @@ def get_comment_replies(
     """List replies under one comment. limit 1-5000 or "all"; returns next_cursor if more."""
 
     def _impl() -> dict[str, Any]:
+        _check_budget(limit)
         client, acct = auth.client_for(account)
         cid = V.validate_graph_id(comment_id, field="comment_id")
         lim = V.validate_limit(limit, default=50, ceiling=CEIL_COMMENTS, all_ceiling=CEIL_COMMENTS)
@@ -1828,6 +1907,7 @@ def get_hashtag_media(
     """
 
     def _impl() -> dict[str, Any]:
+        _check_budget(limit)
         client, acct = auth.client_for(account)
         hid = V.validate_graph_id(hashtag_id, field="hashtag_id")
         e = V.validate_enum(edge, {"top_media", "recent_media"}, field="edge", default="top_media")
@@ -1859,6 +1939,7 @@ def get_mentions(
     """List media where the account is tagged/@-mentioned. limit 1-1000 or "all"."""
 
     def _impl() -> dict[str, Any]:
+        _check_budget(limit)
         client, acct = auth.client_for(account)
         lim = V.validate_limit(limit, ceiling=CEIL_TAGS, all_ceiling=CEIL_TAGS)
         items, cursor = client.paginate(
@@ -2004,21 +2085,42 @@ def list_conversations(
         client, acct = auth.client_for(account)
         lim = V.validate_limit(limit, ceiling=CEIL_CONVERSATIONS, all_ceiling=CEIL_CONVERSATIONS)
         pclient, page_id = _page_dm_client(client, acct)
-        from instagram_mcp import graph_client as _gc
-
-        items: list = []
-        uid = V.validate_graph_id(user_id, field="user_id") if user_id else None
-        page = pclient.get(
-            f"{page_id}/conversations",
-            platform="instagram",
-            fields="id,updated_time",
-            limit=1,
-            after=V.validate_cursor(after),
-            user_id=uid,
+        # One short attempt per page: in development mode Meta can hang for minutes.
+        short = graph_client.GraphClient(
+            pclient._token,
+            base_host=acct.base_host,
+            app_secret=acct.app_secret,
+            timeout=DM_LIST_TIMEOUT_S,
+            max_attempts=1,
         )
+        uid = V.validate_graph_id(user_id, field="user_id") if user_id else None
+        started = _monotonic()
+        items: list = []
         note = None
+        cursor = V.validate_cursor(after)
         nxt: str | None = None
+        first = True
         while True:
+            try:
+                page = short.get(
+                    f"{page_id}/conversations",
+                    platform="instagram",
+                    fields="id,updated_time",
+                    limit=1,
+                    after=cursor,
+                    user_id=uid,
+                )
+            except graph_client.GraphAPIError as exc:
+                if first:
+                    raise
+                nxt = cursor  # resume from the page that failed
+                note = (
+                    "stopped early: Meta timed out (development-mode limit); continue with next_cursor or pass user_id"
+                    if exc.error_class == "dev_mode_limit"
+                    else f"stopped early ({exc.error_class}); continue later with next_cursor"
+                )
+                break
+            first = False
             items.extend(page.get("data") or [])
             nxt = (page.get("paging") or {}).get("cursors", {}).get("after")
             if not nxt or not (page.get("paging") or {}).get("next"):
@@ -2026,25 +2128,14 @@ def list_conversations(
                 break
             if len(items) >= lim:
                 break
-            try:  # later pages can hang in dev mode (hidden non-role conversations)
-                short = _gc.GraphClient(
-                    pclient._token, base_host=acct.base_host, app_secret=acct.app_secret, timeout=20.0, max_attempts=1
-                )
-                page = short.get(
-                    f"{page_id}/conversations", platform="instagram", fields="id,updated_time", limit=1, after=nxt
-                )
-            except graph_client.GraphAPIError as exc:
-                # keep nxt: the caller can resume from this cursor later
-                note = (
-                    "stopped early: Meta timed out (development-mode limit); continue with next_cursor or pass user_id"
-                    if exc.error_class == "dev_mode_limit"
-                    else f"stopped early ({exc.error_class}); continue later with next_cursor"
-                )
+            if _monotonic() - started > DM_LIST_BUDGET_S:
+                note = "stopped at the time budget; continue with next_cursor"
                 break
+            cursor = nxt
         items = items[:lim]
         for c in items:
             try:
-                parts = pclient.get(c["id"], fields="participants").get("participants", {}).get("data", [])
+                parts = short.get(c["id"], fields="participants").get("participants", {}).get("data", [])
                 c["participants"] = [{"username": p.get("username"), "id": p.get("id")} for p in parts]
             except Exception as exc:  # keep listing even if one lookup fails
                 c["participants_error"] = audit.sanitize_error(str(exc))
