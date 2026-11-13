@@ -19,12 +19,15 @@ audit.sanitize_error at the seam.
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import hashlib
 import hmac
 import ipaddress
 import os
 import random
 import socket
+import threading
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -43,6 +46,31 @@ THROTTLE_CODES = frozenset({4, 17, 32, 613, 80002})
 TOKEN_ERROR_CODES = frozenset({190, 102, 463, 467})  # invalid / expired / session errors
 
 _sleep = time.sleep  # patched in tests
+
+# One pooled httpx.Client per (timeout, transport): keeps TCP/TLS connections alive
+# across requests and tool calls instead of a new handshake for every call.
+_CLIENTS: dict[tuple[float, int], httpx.Client] = {}
+_CLIENTS_LOCK = threading.Lock()
+
+
+def _shared_client(timeout: float, transport: httpx.BaseTransport | None) -> httpx.Client:
+    key = (float(timeout), id(transport))
+    with _CLIENTS_LOCK:
+        client = _CLIENTS.get(key)
+        if client is None:
+            client = httpx.Client(timeout=timeout, transport=transport)
+            _CLIENTS[key] = client
+        return client
+
+
+@atexit.register
+def _close_clients() -> None:
+    with _CLIENTS_LOCK:
+        for client in _CLIENTS.values():
+            with contextlib.suppress(Exception):
+                client.close()
+        _CLIENTS.clear()
+
 
 # Latest rate-limit usage reported by Meta response headers (percent of quota).
 LAST_USAGE: dict[str, Any] = {}
@@ -328,8 +356,8 @@ class GraphClient:
             attempt += 1
             can_retry = attempt < (self._max_attempts or MAX_ATTEMPTS)
             try:
-                with httpx.Client(timeout=self._timeout, transport=self._transport or DEFAULT_TRANSPORT) as client:
-                    resp = client.request(method, url, params=query, data=data)
+                client = _shared_client(self._timeout, self._transport or DEFAULT_TRANSPORT)
+                resp = client.request(method, url, params=query, data=data)
             except httpx.TimeoutException as exc:
                 # A timed-out POST may have been processed (published/sent): never repeat it.
                 if method == "GET" and can_retry:
@@ -358,11 +386,21 @@ class GraphClient:
                 body = {}
             if resp.status_code >= 400 or (isinstance(body, dict) and "error" in body):
                 err = _map_graph_error(body if isinstance(body, dict) else {}, resp.status_code)
-                throttled = err.code in THROTTLE_CODES or resp.status_code == 429
-                server_side = resp.status_code >= 500 or err.transient
-                if can_retry and (throttled or (method == "GET" and server_side)):
-                    _sleep(_retry_after(getattr(resp, "headers", None)) or _backoff(attempt))
+                retry_after = _retry_after(getattr(resp, "headers", None))
+                # Only short bursts are worth waiting for; hourly limits (4/17/32/80002) fail fast.
+                burst = err.code == 613 or (resp.status_code == 429 and retry_after is not None)
+                server_side = (resp.status_code >= 500 or err.transient) and err.error_class != "dev_mode_limit"
+                if can_retry and (burst or (method == "GET" and server_side)):
+                    _sleep(retry_after or _backoff(attempt))
                     continue
+                if err.error_class == "rate_limited" and not burst:
+                    pct = LAST_USAGE.get("max_percent")
+                    usage = f" (current usage {pct}%)" if pct is not None else ""
+                    err.extra = {
+                        **(err.extra or {}),
+                        "hint": f"Meta's hourly rate limit was reached{usage}. It "
+                        'resets within an hour; avoid limit="all" and repeated calls until then.',
+                    }
                 raise err
             return body if isinstance(body, dict) else {"data": body}
 

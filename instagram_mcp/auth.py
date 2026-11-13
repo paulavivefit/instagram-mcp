@@ -21,12 +21,14 @@ Default-account resolution precedence:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -221,6 +223,7 @@ def add_account(
     make_default: bool = False,
 ) -> dict[str, Any]:
     """Store an account's token in the secret backend + metadata in accounts.json."""
+    clear_cache()
     if base_host not in graph_client.ALLOWED_HOSTS:
         raise AuthError(f"base_host must be one of {sorted(graph_client.ALLOWED_HOSTS)}")
     if label == "env":
@@ -250,6 +253,7 @@ def add_account(
 
 
 def remove_account(label: str) -> dict[str, Any]:
+    clear_cache()
     meta = _load_meta()
     existed = label in meta["accounts"]
     _secret_delete(label)
@@ -265,6 +269,7 @@ def remove_account(label: str) -> dict[str, Any]:
 
 
 def set_default(label: str) -> dict[str, Any]:
+    clear_cache()
     meta = _load_meta()
     if label not in meta["accounts"] and not (label == "env" and os.environ.get(ENV_TOKEN)):
         raise AuthError(f"unknown account {label!r}")
@@ -273,7 +278,39 @@ def set_default(label: str) -> dict[str, Any]:
     return {"default": label}
 
 
+# Resolved accounts cached in memory: avoids 1-2 keychain subprocess calls per tool call.
+_RESOLVE_CACHE: dict[tuple[Any, ...], ResolvedAccount] = {}
+_RESOLVE_LOCK = threading.Lock()
+
+
+def clear_cache() -> None:
+    with _RESOLVE_LOCK:
+        _RESOLVE_CACHE.clear()
+
+
+def _cache_key(label: str | None) -> tuple[Any, ...]:
+    try:
+        mtime = ACCOUNTS_PATH.stat().st_mtime_ns
+    except OSError:
+        mtime = None
+    env = os.environ.get(ENV_TOKEN) or ""
+    return (label, mtime, hashlib.sha256(env.encode()).hexdigest(), os.environ.get(ENV_IG_USER_ID))
+
+
 def resolve(label: str | None = None) -> ResolvedAccount:
+    """Resolve label -> ResolvedAccount (cached until accounts.json or the env account changes)."""
+    key = _cache_key(label)
+    with _RESOLVE_LOCK:
+        hit = _RESOLVE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    acct = _resolve_uncached(label)
+    with _RESOLVE_LOCK:
+        _RESOLVE_CACHE[key] = acct
+    return acct
+
+
+def _resolve_uncached(label: str | None = None) -> ResolvedAccount:
     """Resolve label -> ResolvedAccount (with token). Internal use only."""
     meta = _load_meta()
     # Explicit env account, or default falling through to env.

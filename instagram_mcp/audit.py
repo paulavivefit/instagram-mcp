@@ -107,8 +107,24 @@ def classify_error(exc: BaseException) -> str:
     return "upstream_error"
 
 
+AUDIT_MAX_BYTES = 5 * 1024 * 1024  # rotate to audit.log.jsonl.1 above 5 MB
+
+
+def _audit_path() -> Path:
+    env = os.environ.get("INSTAGRAM_MCP_AUDIT_PATH")
+    return Path(env) if env else AUDIT_PATH
+
+
 def _ensure_dir() -> None:
-    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _audit_path().parent.mkdir(parents=True, exist_ok=True)
+
+
+def _rotate(path: Path) -> None:
+    try:
+        if path.exists() and path.stat().st_size > AUDIT_MAX_BYTES:
+            os.replace(path, path.with_name(path.name + ".1"))
+    except OSError:
+        pass
 
 
 def record(
@@ -139,7 +155,9 @@ def record(
         payload["extra"] = sanitize_payload(extra)
     try:
         _ensure_dir()
-        with AUDIT_PATH.open("a", encoding="utf-8") as f:
+        path = _audit_path()
+        _rotate(path)
+        with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception:
         # Audit must never break the tool call. Silent failure here is acceptable.
