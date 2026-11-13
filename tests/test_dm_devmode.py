@@ -51,3 +51,12 @@ def test_no_role_recipient_gets_hint_in_any_language(dm_account):
     for res in (call(server.send_message)("921", "hi"), call(server.mark_seen)("921")):
         assert res["ok"] is False and res["error_class"] == "permission"
         assert "Tester" in res["hint"] and "App Review" in res["hint"]
+
+
+def test_generic_error_on_conversations_gets_dev_mode_hint(dm_account):
+    """Live 2026-11-13: Meta also answers the dev-mode scan with a generic 'unknown error'."""
+    from instagram_mcp import server
+    dm_account.route("GET", CONVS, (500, {"error": {"message": "An unknown error occurred", "code": 1}}))
+    res = call(server.list_conversations)()
+    assert res["ok"] is False and res["error_class"] == "upstream_error"  # not relabelled
+    assert "development mode" in res["hint"] and "user_id" in res["hint"]

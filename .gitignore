@@ -20,3 +20,4 @@ audit.log.jsonl
 # Build
 dist/
 build/
+.coverage
