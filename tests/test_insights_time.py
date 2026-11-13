@@ -24,6 +24,14 @@ def frozen_now(monkeypatch):
 
 
 def _insights_responder(req):
+    """Meta-like fake: values per Pacific day, both edges inclusive (see test_user_feedback)."""
+    from tests.test_user_feedback import _meta_like_daily
+    out = _meta_like_daily(req)
+    assert int(req.params["until"]) - int(req.params["since"]) <= 30 * DAY, "Meta rejects windows longer than 30 days"
+    return out
+
+
+def _insights_responder_old(req):
     since, until = int(req.params["since"]), int(req.params["until"])
     assert until - since <= 30 * DAY, "Meta rejects windows longer than 30 days"
     out = []
@@ -33,7 +41,7 @@ def _insights_responder(req):
         else:
             days = (until - since) // DAY
             out.append({"name": m, "period": "day",
-                        "values": [{"value": 1, "end_time": str(since + (i + 1) * DAY)} for i in range(days)]})
+                        "values": [{"value": 1, "end_time": datetime.fromtimestamp(since + (i + 1) * DAY, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+0000")} for i in range(days)]})
     return {"data": out}
 
 
@@ -48,11 +56,13 @@ def test_range_over_30_days_is_chunked(account, frozen_now):
     windows = sorted({(int(c.params["since"]), int(c.params["until"])) for c in calls})
     assert len(windows) == 4  # 92 days -> 30+30+30+2
     assert all(u - s <= 30 * DAY for s, u in windows)
-    assert windows[0][0] == int(datetime(2026, 8, 1, tzinfo=timezone.utc).timestamp())
-    by_name = {d["name"]: d for d in res["insights"]}
-    assert len(by_name["reach"]["values"]) == 92  # daily values stitched in order
-    assert by_name["views"]["total_value"]["value"] == 40  # summed over 4 windows
-    assert by_name["views"]["windows"] == 4
+    # windows start 1 s after Pacific midnight (Meta includes both edges): 2026-08-01 00:00 PDT = 07:00 UTC
+    assert windows[0][0] == int(datetime(2026, 8, 1, 7, tzinfo=timezone.utc).timestamp()) + 1
+    m = res["metrics"]
+    assert len(m["reach"]) == 92  # daily values stitched in order
+    assert m["reach"][0]["date"] == "2026-08-01" and m["reach"][-1]["date"] == "2026-10-31"
+    assert m["views"] == 10 * 92  # summed over 4 windows, exactly the 92 requested days
+    assert res["complete"] is True
 
 
 def test_follower_count_only_requested_for_last_30_days(account, frozen_now):
@@ -160,9 +170,10 @@ def test_insights_summary_compares_with_previous_period(account, frozen_now):
     from instagram_mcp import server
 
     def responder(req):
-        since = int(req.params["since"])
+        since, until = int(req.params["since"]), int(req.params["until"])
         current = since >= int((frozen_now - timedelta(days=30)).timestamp()) - DAY
-        val = 200 if current else 100
+        days = round((until - since) / DAY)  # Meta returns one total per requested window
+        val = days * (10 if current else 5)
         out = []
         for m in req.params["metric"].split(","):
             if req.params.get("metric_type") == "total_value":
@@ -175,7 +186,7 @@ def test_insights_summary_compares_with_previous_period(account, frozen_now):
     account.route("GET", rf"^/{FAKE_IG_ID}$", {"followers_count": 5000, "media_count": 10})
     res = call(server.insights_summary)(period="last_30_days")
     assert res["ok"] is True, res
-    assert res["current"]["views"] == 200 and res["previous"]["views"] == 100
+    assert res["current"]["views"] == 300 and res["previous"]["views"] == 150  # 30 days each, no overlap
     assert res["change_pct"]["views"] == 100.0
     assert res["followers_now"] == 5000
     assert res["new_followers"] == 12

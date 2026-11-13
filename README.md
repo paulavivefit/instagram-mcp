@@ -77,6 +77,10 @@ Or skip the env vars and call `add_account` at runtime (token goes to your OS ke
 
 **Review before posting** — every `publish_*` tool takes `prepare_only=true`: Instagram downloads and processes the post (and validates tags, collaborators, location) but nothing is published; call `publish_container(container_id)` within ~24 h to publish it.
 
+**Honest numbers** — insights come back flat (`metrics: {views: 202790, reach: [{date, value}, ...]}`; `raw=true` for Meta's original). Dates are **Meta's Pacific-time days** (a value stamped 08:00 UTC belongs to the previous Pacific day); ranges are split into Meta's 30-day windows on Pacific-day boundaries with no day counted twice. When Meta has no real value for a period (e.g. account `views` before mid-2025, or 0/negative numbers next to real activity) the metric is `null` and listed in `unavailable`, never a fake 0. Old reels and pre-2023 posts get a `warnings` entry because Meta under-reports their reach. `healthcheck` shows token scopes/expiry and which features actually work (DMs in development mode, hashtag access).
+
+**DMs before App Review** — Meta only lets the app read/send DMs with people who have a role on the app, and a large inbox makes conversation listing time out in development mode; pass `user_id` to `list_conversations` to fetch one person's conversation. There is no Meta API to look up a DM id (IGSID) from a username; it only comes from conversations or webhooks.
+
 **Known Meta limits (verified live)** — plain feed videos are no longer accepted, so `publish_video` publishes a reel shown in the grid; video links from Instagram's own CDN (cdninstagram.com / fbcdn.net) are rejected as sources; tagged users and collaborators must be public accounts; `location_id` must be a Facebook Page with an address; hashtag search needs Meta's *Instagram Public Content Access* feature (App Review). The API cannot delete posts.
 
 > Publishing takes **public https media URLs** — Instagram fetches the bytes itself, so the image/video must be reachable on the open web (an S3/Cloudflare/any-CDN URL works).

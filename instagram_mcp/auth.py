@@ -53,6 +53,12 @@ class AuthError(RuntimeError):
     error_class = "auth"
 
 
+class UnknownAccountError(AuthError):
+    """The caller named an account label that is not configured (an input mistake)."""
+
+    error_class = "validation"
+
+
 @dataclass
 class ResolvedAccount:
     label: str
@@ -282,7 +288,7 @@ def resolve(label: str | None = None) -> ResolvedAccount:
         raise AuthError("no account configured — set INSTAGRAM_MCP_ACCESS_TOKEN or call add_account")
     info = meta["accounts"].get(target)
     if not info:
-        raise AuthError(f"unknown account {target!r} — call list_accounts to see configured accounts")
+        raise UnknownAccountError(f"unknown account {target!r} — call list_accounts to see configured accounts")
     token = _secret_get(target)
     if not token:
         raise AuthError(f"no stored token for account {target!r} ({secret_backend()}) — re-run add_account")

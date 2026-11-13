@@ -28,7 +28,7 @@ def test_account_insights_default_splits_time_series_and_total_value(account):
                                                        "accounts_engaged", "total_interactions"}
     assert tv[0].params["period"] == "day"  # total_value metrics only accept period=day
     assert "impressions" not in ",".join(c.params["metric"] for c in calls)
-    names = {d["name"] for d in res["insights"]}
+    names = set(res["metrics"])
     assert names == {"reach", "follower_count", "views", "profile_views",
                      "accounts_engaged", "total_interactions"}
 
@@ -63,7 +63,7 @@ def test_account_insights_partial_failure_reports_errors(account):
     account.route("GET", INSIGHTS, responder)
     res = call(server.get_account_insights)()
     assert res["ok"] is True
-    assert {d["name"] for d in res["insights"]} == {"reach", "follower_count"}
+    assert set(res["metrics"]) == {"reach", "follower_count"}
     assert len(res["errors"]) == 1 and "bad metric" in res["errors"][0]["error"]
 
 
@@ -147,9 +147,11 @@ def test_media_insights_story_metrics(account):
     assert "replies" in metric and "likes" not in metric
 
 
-def test_media_insights_explicit_metrics_skip_lookup(account):
+def test_media_insights_explicit_metrics_are_used(account):
     from instagram_mcp import server
+    account.route("GET", r"^/1789$", {"media_product_type": "FEED"})
     account.route("GET", r"^/1789/insights$", _echo_metrics)
     res = call(server.get_media_insights)("1789", metrics="reach")
     assert res["ok"] is True, res
-    assert account.calls("GET", r"^/1789$") == []
+    assert account.calls("GET", r"^/1789/insights$")[0].params["metric"] == "reach"
+    assert res["metrics"] == {"reach": 1}
