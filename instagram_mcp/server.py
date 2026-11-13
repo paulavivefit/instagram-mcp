@@ -44,6 +44,7 @@ from pydantic import Field
 
 from instagram_mcp import audit, auth, graph_client
 from instagram_mcp import insights_metrics as IM
+from instagram_mcp import insights_shape as SH
 from instagram_mcp import validators as V
 
 mcp = FastMCP("instagram-mcp")
@@ -130,6 +131,27 @@ def _summarize(result: Any) -> Any:
     return {"type": type(result).__name__}
 
 
+# What the last real calls showed about Meta-side availability (shown by healthcheck).
+_FEATURE_STATE: dict[str, str] = {}
+_DM_TOOLS = {"list_conversations", "get_messages", "send_message", "mark_seen"}
+_HASHTAG_TOOLS = {"search_hashtag", "get_hashtag_media"}
+
+
+def _record_feature(tool: str, result: dict[str, Any]) -> None:
+    if tool in _DM_TOOLS:
+        if result.get("ok"):
+            _FEATURE_STATE["dm"] = "ok"
+        elif result.get("error_class") == "dev_mode_limit":
+            _FEATURE_STATE["dm"] = "dev_mode_limit"
+        elif result.get("error_class") == "permission":
+            _FEATURE_STATE["dm"] = "no_role"
+    elif tool in _HASHTAG_TOOLS:
+        if result.get("ok"):
+            _FEATURE_STATE["hashtag"] = "ok"
+        elif "Public Content Access" in str(result.get("hint", "")):
+            _FEATURE_STATE["hashtag"] = "needs_public_content_access"
+
+
 def _guard(tool: str, input_payload: dict[str, Any], impl: Any) -> dict[str, Any]:
     """Run a tool body with audit + fail-safe sanitized error shaping.
 
@@ -142,6 +164,8 @@ def _guard(tool: str, input_payload: dict[str, Any], impl: Any) -> dict[str, Any
     try:
         result = impl()
         audit.record(tool, execution_time_ms=_ms(start), io={"input": safe_in, "output": _summarize(result)})
+        if isinstance(result, dict):
+            _record_feature(tool, result)
         return result
     except Exception as exc:  # noqa: BLE001 — boundary: classify + sanitize, never re-raise raw
         error_class = audit.classify_error(exc)
@@ -158,6 +182,7 @@ def _guard(tool: str, input_payload: dict[str, Any], impl: Any) -> dict[str, Any
         extra = getattr(exc, "extra", None)
         if isinstance(extra, dict):
             out.update({k: v for k, v in extra.items() if k not in out})
+        _record_feature(tool, out)
         return out
 
 
@@ -329,6 +354,7 @@ def healthcheck() -> dict[str, Any]:
             client, acct = auth.client_for(None)
             me = client.get(acct.ig_user_id, fields="id,username")
             out["live_check"] = {"ok": True, "username": me.get("username"), "account": acct.label}
+            out["token"] = _token_info(client, acct)
             if graph_client.LAST_USAGE:
                 usage = dict(graph_client.LAST_USAGE)
                 if usage.get("max_percent", 0) >= 80:
@@ -343,9 +369,49 @@ def healthcheck() -> dict[str, Any]:
                 "error": audit.sanitize_error(str(exc)),
                 "error_class": audit.classify_error(exc),
             }
+        out["features"] = _features(out["dm_enabled"])
         return out
 
     return _guard("healthcheck", {}, _impl)
+
+
+DM_STATUS_TEXT = {
+    "ok": "working (last call succeeded)",
+    "dev_mode_limit": "blocked: Meta development mode (inbox too large to scan); pass user_id or wait for App Review",
+    "no_role": "blocked: Meta only allows people with an app role until App Review approves instagram_manage_messages",
+    "not_checked": "not checked yet in this session",
+}
+
+
+def _features(dm_enabled: bool) -> dict[str, Any]:
+    dm = _FEATURE_STATE.get("dm", "not_checked") if dm_enabled else "disabled"
+    blocked = dm in {"dev_mode_limit", "no_role"}
+    hashtag = _FEATURE_STATE.get("hashtag")
+    return {
+        "dm": {"status": dm, "detail": DM_STATUS_TEXT.get(dm, "turned off (INSTAGRAM_MCP_DM_ENABLED)")},
+        "app_mode": "development (inferred from Meta's DM errors)" if blocked else "unknown (Meta does not report it)",
+        "hashtag_search": "working"
+        if hashtag == "ok"
+        else ("needs Meta's Instagram Public Content Access feature (App Review)"),
+        "publishing": "available (use prepare_only=true to check a post before publishing)",
+        "insights": "available for the last 2 years; dates are Meta's Pacific-time days",
+    }
+
+
+def _token_info(client: graph_client.GraphClient, acct: Any) -> dict[str, Any]:
+    from datetime import datetime, timezone
+
+    try:
+        d = client.get("debug_token", input_token=acct.access_token).get("data") or {}
+    except graph_client.GraphAPIError as exc:
+        return {"checked": False, "error": audit.sanitize_error(str(exc))}
+    info: dict[str, Any] = {"valid": d.get("is_valid"), "scopes": d.get("scopes") or []}
+    exp = d.get("data_access_expires_at")
+    if exp:
+        info["data_access_expires"] = datetime.fromtimestamp(exp, timezone.utc).date().isoformat()
+    if d.get("expires_at"):
+        info["expires"] = datetime.fromtimestamp(d["expires_at"], timezone.utc).date().isoformat()
+    return info
 
 
 @mcp.tool(annotations={"title": "List configured accounts", "readOnlyHint": True, "openWorldHint": True})
@@ -443,21 +509,6 @@ def remove_account(label: LabelArg) -> dict[str, Any]:
     )
 
 
-@mcp.tool(annotations={"title": "Account snapshot", "readOnlyHint": True, "openWorldHint": True})
-def account_info(account: AccountArg = None) -> dict[str, Any]:
-    """Live profile snapshot for one account: username, name, followers, media count, etc."""
-
-    def _impl() -> dict[str, Any]:
-        client, acct = auth.client_for(account)
-        prof = client.get(acct.ig_user_id, fields=PROFILE_FIELDS)
-        return {"ok": True, "account": acct.label, "profile": prof}
-
-    return _guard("account_info", {"account": account}, _impl)
-
-
-# ============================ PROFILE + MEDIA ============================ #
-
-
 @mcp.tool(annotations={"title": "Get profile", "readOnlyHint": True, "openWorldHint": True})
 def get_profile(account: AccountArg = None) -> dict[str, Any]:
     """Return the account's public profile fields (followers, follows, media count, bio, website)."""
@@ -542,7 +593,10 @@ def get_media(media_id: MediaIdArg, account: AccountArg = None) -> dict[str, Any
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         mid = V.validate_graph_id(media_id, field="media_id")
-        return {"ok": True, "account": acct.label, "media": client.get(mid, fields=MEDIA_FIELDS + "," + CHILD_FIELDS)}
+        media = client.get(mid, fields=MEDIA_FIELDS + "," + CHILD_FIELDS)
+        if isinstance(media.get("children"), dict):
+            media["children"] = media["children"].get("data") or []
+        return {"ok": True, "account": acct.label, "media": media}
 
     return _guard("get_media", {"media_id": media_id, "account": account}, _impl)
 
@@ -557,34 +611,73 @@ def _utcnow():
 
 
 MAX_WINDOW_S = 30 * 86400  # Meta: at most 30 days between since and until
-MAX_HISTORY_DAYS = 730  # Meta keeps ~2 years of account insights
+MAX_HISTORY_DAYS = 729  # live: since = now-729d works, now-730d is rejected
 
 
-def _resolve_range(since: str | None, until: str | None):
-    """-> (since_dt, until_dt) or (None, None). Date-only `until` is inclusive (next midnight)."""
+def _earliest_insights_date():
+    from datetime import timedelta
+
+    return SH.pacific_today(_utcnow() - timedelta(days=MAX_HISTORY_DAYS)) + timedelta(days=1)
+
+
+def _resolve_range(since: str | None, until: str | None, *, allow_old: bool = False):
+    """-> (start, end) UTC instants or (None, None).
+
+    Date-only values are Pacific calendar days (Meta's insight days): since=D starts at
+    00:00 Pacific on D, until=D is inclusive (ends at 00:00 Pacific on D+1).
+    """
     from datetime import timedelta
 
     if not since and not until:
         return None, None
     now = _utcnow()
-    end = V.validate_date(until, field="until")
-    if end is not None and until and len(until.strip()) == 10:
-        end = end + timedelta(days=1)
+
+    def parse(value, field, inclusive_end=False):
+        if not value:
+            return None
+        v = value.strip()
+        V.validate_date(v, field=field)  # format check (rejects 20261031 etc.)
+        if len(v) == 10:
+            day = SH.pacific_midnight(v)
+            return day + timedelta(days=1) if inclusive_end else day
+        if not ("T" in v or " " in v):
+            raise V.ValidationError(f"{field} must be YYYY-MM-DD or a full ISO date-time")
+        return V.validate_date(v, field=field)
+
+    end = parse(until, "until", inclusive_end=True)
     end = min(end or now, now)
-    start = V.validate_date(since, field="since") or (end - timedelta(days=30))
+    start = parse(since, "since") or (end - timedelta(days=30))
     if start >= end:
         raise V.ValidationError("since must be before until (and not in the future)")
-    if start < now - timedelta(days=MAX_HISTORY_DAYS):
-        raise V.ValidationError("Meta only keeps about 2 years of insights; use a later `since`")
+    if end - start < timedelta(hours=23):
+        raise V.ValidationError("the range must cover at least one full day")
+    if not allow_old and start < now - timedelta(days=MAX_HISTORY_DAYS):
+        raise V.ValidationError(
+            f"Meta only keeps insights for the last 2 years; the earliest since you can use is "
+            f"{_earliest_insights_date().isoformat()}."
+        )
     return start, end
 
 
 def _windows(start, end):
+    """Split [start, end) into Meta-sized windows on Pacific-day boundaries.
+
+    Meta allows at most 30 days (2,592,000 s) per request. 30 Pacific days across the
+    autumn DST change last 30 d + 1 h, so such a window is shortened to 29 days instead
+    of leaving a 1-hour sliver (which would double-count totals).
+    """
     from datetime import timedelta
 
     out, cur = [], start
     while cur < end:
-        nxt = min(cur + timedelta(seconds=MAX_WINDOW_S), end)
+        day = SH.pacific_today(cur)
+        nxt = None
+        for span in (30, 29):
+            candidate = SH.pacific_midnight(day + timedelta(days=span))
+            if (candidate - cur).total_seconds() <= MAX_WINDOW_S:
+                nxt = candidate
+                break
+        nxt = min(nxt or cur + timedelta(seconds=MAX_WINDOW_S), end)
         out.append((cur, nxt))
         cur = nxt
     return out
@@ -592,67 +685,102 @@ def _windows(start, end):
 
 def _account_insights_range(
     client, acct, ts: list[str], tv: list[str], start, end, period: str = "day"
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    """Fetch account insights over [start, end): chunked into 30-day windows and merged.
+) -> dict[str, Any]:
+    """Fetch account insights over [start, end) in 30-day windows (Meta's maximum).
 
-    Time-series metrics get their daily values stitched in order; total_value metrics are
-    summed across windows (unique-user metrics like reach/accounts_engaged may then
-    double-count across windows; flagged with `windows`). follower_count is only
-    available for the last 30 days, so it is clamped to that range.
+    Returns {"series", "totals", "unavailable", "incomplete", "errors", "notes", "raw"}:
+    daily series are stitched with Pacific `date`s; totals are summed over windows after
+    nulling values that are not real data (0/negative next to activity). follower_count is
+    only available for the last 30 days (excluding today) and is clamped to that.
     """
     from datetime import timedelta
 
-    merged: dict[str, dict[str, Any]] = {}
+    series: dict[str, list[dict[str, Any]]] = {}
+    window_totals: list[dict[str, Any]] = []
+    unavailable: dict[str, str] = {}
     errors: list[dict[str, Any]] = []
     notes: list[str] = []
+    raw: list[dict[str, Any]] = []
 
     def fetch(params, group, win):
         try:
-            return client.get(
-                f"{acct.ig_user_id}/insights", since=int(win[0].timestamp()), until=int(win[1].timestamp()), **params
+            # Meta includes BOTH edges (every day whose end_time is in [since, until]); start
+            # 1 s after the window start so the day ending exactly at `since` is excluded and
+            # adjacent windows never overlap.
+            rows = client.get(
+                f"{acct.ig_user_id}/insights",
+                since=int(win[0].timestamp()) + 1,
+                until=int(win[1].timestamp()),
+                **params,
             ).get("data", [])
+            raw.extend(rows)
+            return rows
         except graph_client.GraphAPIError as exc:
             errors.append(
                 {
                     "metrics": group,
-                    "since": win[0].date().isoformat(),
+                    "since": SH.pacific_today(win[0]).isoformat(),
                     "error": audit.sanitize_error(str(exc)),
                     "error_class": exc.error_class,
                 }
             )
-            return []
-
-    def add(rows, total: bool):
-        for row in rows:
-            name = row.get("name")
-            slot = merged.setdefault(name, {"name": name, "period": row.get("period", period)})
-            if total:
-                val = ((row.get("total_value") or {}).get("value")) or 0
-                slot.setdefault("total_value", {"value": 0})
-                slot["total_value"]["value"] += val if isinstance(val, (int, float)) else 0
-                slot["windows"] = slot.get("windows", 0) + 1
-            else:
-                slot.setdefault("values", []).extend(row.get("values") or [])
+            return None
 
     ts_main = [m for m in ts if m != "follower_count"]
-    for win in _windows(start, end):
+    windows = _windows(start, end)
+    for win in windows:
+        activity = 0.0
         if ts_main:
-            add(fetch({"metric": ",".join(ts_main), "period": period}, ts_main, win), total=False)
+            for row in fetch({"metric": ",".join(ts_main), "period": period}, ts_main, win) or []:
+                flat = SH.flatten_series(row.get("values"))
+                series.setdefault(row.get("name"), []).extend(flat)
+                if row.get("name") == "reach":
+                    activity += sum(v["value"] for v in flat if isinstance(v.get("value"), (int, float)))
         if tv:
-            add(
-                fetch({"metric": ",".join(tv), "period": IM.TOTAL_VALUE_PERIOD, "metric_type": "total_value"}, tv, win),
-                total=True,
+            rows = fetch(
+                {"metric": ",".join(tv), "period": IM.TOTAL_VALUE_PERIOD, "metric_type": "total_value"}, tv, win
             )
+            if rows is not None:
+                clean, bad = SH.clean_window_totals(
+                    {r.get("name"): SH.row_value(r) for r in rows if r.get("name")}, activity
+                )
+                window_totals.append(clean)
+                unavailable.update(bad)
     if "follower_count" in ts:
-        today = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today = SH.pacific_midnight(SH.pacific_today(_utcnow()))
         f_start, f_end = max(start, today - timedelta(days=30)), min(end, today)
         if f_start < f_end:
-            add(fetch({"metric": "follower_count", "period": "day"}, ["follower_count"], (f_start, f_end)), total=False)
+            for row in fetch({"metric": "follower_count", "period": "day"}, ["follower_count"], (f_start, f_end)) or []:
+                series.setdefault("follower_count", []).extend(SH.flatten_series(row.get("values")))
         if start < today - timedelta(days=30) or f_start >= f_end:
             notes.append(
                 "follower_count is only available for the last 30 days (excluding today); older days were skipped."
             )
-    return list(merged.values()), errors, notes
+
+    totals: dict[str, Any] = {}
+    incomplete: dict[str, dict[str, int]] = {}
+    for name in tv:
+        vals = [w.get(name) for w in window_totals if name in w]
+        ok_vals = [v for v in vals if v is not None]
+        totals[name] = sum(ok_vals) if ok_vals else None
+        if totals[name] is not None:
+            unavailable.pop(name, None)
+        if len(ok_vals) < len(windows):
+            incomplete[name] = {"windows_ok": len(ok_vals), "windows_expected": len(windows)}
+            if totals[name] is not None:
+                unavailable.setdefault(name, "partial: " + SH.UNAVAILABLE_REASON)
+    return {
+        "series": series,
+        "totals": totals,
+        "unavailable": unavailable,
+        "incomplete": incomplete,
+        "errors": errors,
+        "notes": notes,
+        "raw": raw,
+    }
+
+
+RawArg = Annotated[bool, Field(description="True to also return Meta's original rows (verbose, localized titles).")]
 
 
 @mcp.tool(annotations={"title": "Account insights", "readOnlyHint": True, "openWorldHint": True})
@@ -670,56 +798,50 @@ def get_account_insights(
         Field(description="Bucket for daily-series metrics (reach, follower_count). Totals always use day."),
     ] = "day",
     since: Annotated[
-        str | None, Field(description='Start date, e.g. "2026-10-01". Up to about 2 years back. Optional.')
+        str | None,
+        Field(description='Start day "YYYY-MM-DD" (Pacific-time day, Meta\'s convention). Up to 2 years back.'),
     ] = None,
-    until: Annotated[
-        str | None, Field(description='End date (inclusive), e.g. "2026-10-31". Defaults to now. Optional.')
-    ] = None,
+    until: Annotated[str | None, Field(description='End day "YYYY-MM-DD", inclusive. Defaults to now.')] = None,
+    raw: RawArg = False,
 ) -> dict[str, Any]:
-    """Account-level analytics, optionally over a date range.
+    """Account analytics as flat numbers: totals plus daily series dated by Pacific day.
 
-    metrics: comma-separated Graph metric names. Default: reach, follower_count (daily
-    series) + views, profile_views, accounts_engaged, total_interactions (totals).
-    since/until: dates like 2026-10-01 (until inclusive; up to ~2 years back). Longer
-    ranges are split into 30-day requests (Meta's maximum) and merged: daily series are
-    stitched, totals summed (see `windows`). follower_count only covers the last 30 days.
-    Without since/until Meta returns its default recent window.
+    Default metrics: reach and follower_count (daily, [{date, value}]) plus views,
+    profile_views, accounts_engaged, total_interactions (totals). Long ranges are split
+    into Meta's 30-day windows and merged. A total is null (see `unavailable`) when Meta
+    has no real value for that period (e.g. account views before mid-2025), never a fake 0.
+    Dates are Meta's Pacific-time days.
     """
 
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         names = IM.parse_metric_list(metrics, IM.DEFAULT_ACCOUNT_METRICS)
+        if not names:
+            raise V.ValidationError("metrics must name at least one metric")
         per = V.validate_enum(period, {"day", "week", "days_28", "lifetime"}, field="period", default="day")
         ts, tv = IM.split_account_metrics(names)
         start, end = _resolve_range(since, until)
-        notes: list[str] = []
-        if start is not None:
-            insights, errors, notes = _account_insights_range(client, acct, ts, tv, start, end, per)
+        if start is None:
+            res = _account_insights_default(client, acct, ts, tv, per)
         else:
-            insights, errors = [], []
-            groups = []
-            if ts:
-                groups.append(({"metric": ",".join(ts), "period": per}, ts))
-            if tv:
-                groups.append(
-                    ({"metric": ",".join(tv), "period": IM.TOTAL_VALUE_PERIOD, "metric_type": "total_value"}, tv)
-                )
-            for params, group in groups:
-                try:
-                    insights.extend(client.get(f"{acct.ig_user_id}/insights", **params).get("data", []))
-                except graph_client.GraphAPIError as exc:
-                    errors.append(
-                        {"metrics": group, "error": audit.sanitize_error(str(exc)), "error_class": exc.error_class}
-                    )
-        if not insights and errors:
-            raise graph_client.GraphAPIError(errors[0]["error"], error_class=errors[0]["error_class"])
-        out: dict[str, Any] = {"ok": True, "account": acct.label, "period": per, "insights": insights}
+            res = _account_insights_range(client, acct, ts, tv, start, end, per)
+        values = {**res["series"], **res["totals"]}
+        if not values and res["errors"]:
+            raise graph_client.GraphAPIError(res["errors"][0]["error"], error_class=res["errors"][0]["error_class"])
+        out: dict[str, Any] = {"ok": True, "account": acct.label, "period": per, "metrics": values}
         if start is not None:
-            out["since"], out["until"] = start.isoformat(), end.isoformat()
-        if errors:
-            out["errors"] = errors
-        if notes:
-            out["note"] = " ".join(notes)
+            from datetime import timedelta
+
+            out["since"] = SH.pacific_today(start).isoformat()
+            out["until"] = SH.pacific_today(end - timedelta(seconds=1)).isoformat()
+        for key in ("unavailable", "incomplete", "errors"):
+            if res[key]:
+                out[key] = res[key]
+        out["complete"] = not res["incomplete"] and not res["errors"]
+        if res["notes"]:
+            out["note"] = " ".join(res["notes"])
+        if raw:
+            out["raw"] = res["raw"]
         return out
 
     return _guard(
@@ -729,22 +851,65 @@ def get_account_insights(
     )
 
 
+def _account_insights_default(client, acct, ts: list[str], tv: list[str], period: str) -> dict[str, Any]:
+    """Meta's default recent window (no since/until), shaped like _account_insights_range."""
+    res: dict[str, Any] = {
+        "series": {},
+        "totals": {},
+        "unavailable": {},
+        "incomplete": {},
+        "errors": [],
+        "notes": [],
+        "raw": [],
+    }
+    activity = 0.0
+    if ts:
+        try:
+            rows = client.get(f"{acct.ig_user_id}/insights", metric=",".join(ts), period=period).get("data", [])
+            res["raw"].extend(rows)
+            for row in rows:
+                flat = SH.flatten_series(row.get("values"))
+                res["series"][row.get("name")] = flat
+                if row.get("name") == "reach":
+                    activity += sum(v["value"] for v in flat if isinstance(v.get("value"), (int, float)))
+        except graph_client.GraphAPIError as exc:
+            res["errors"].append(
+                {"metrics": ts, "error": audit.sanitize_error(str(exc)), "error_class": exc.error_class}
+            )
+    if tv:
+        try:
+            rows = client.get(
+                f"{acct.ig_user_id}/insights",
+                metric=",".join(tv),
+                period=IM.TOTAL_VALUE_PERIOD,
+                metric_type="total_value",
+            ).get("data", [])
+            res["raw"].extend(rows)
+            clean, bad = SH.clean_window_totals(
+                {r.get("name"): SH.row_value(r) for r in rows if r.get("name")}, activity
+            )
+            res["totals"], res["unavailable"] = clean, bad
+        except graph_client.GraphAPIError as exc:
+            res["errors"].append(
+                {"metrics": tv, "error": audit.sanitize_error(str(exc)), "error_class": exc.error_class}
+            )
+    return res
+
+
 SORT_METRICS = frozenset({"reach", "views", "likes", "comments", "shares", "saved", "total_interactions"})
+COUNT_METRICS = {"likes": "like_count", "comments": "comments_count"}  # available on every post, no insights
 SUMMARY_TOTALS = ("views", "reach", "accounts_engaged", "total_interactions", "profile_views")
 SUMMARY_PERIODS = {"last_7_days": 7, "last_30_days": 30, "last_90_days": 90}
 
 
 def _metric_value(row: dict[str, Any]) -> Any:
-    if row.get("total_value"):
-        return row["total_value"].get("value")
-    vals = row.get("values") or []
-    return vals[0].get("value") if vals else None
+    return SH.row_value(row)
 
 
 def _batch_media_insights(client: graph_client.GraphClient, posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Fetch insights for many posts via Graph batch requests (50 per call).
 
-    Sets post["metrics"] = {name: value} on success; returns per-post errors.
+    Sets post["metrics"] = {name: value} (+ post["warnings"]) on success; returns per-post errors.
     """
     import json
 
@@ -754,22 +919,30 @@ def _batch_media_insights(client: graph_client.GraphClient, posts: list[dict[str
         batch = [
             {
                 "method": "GET",
-                "relative_url": f"{p['id']}/insights?metric="
+                "relative_url": f"{V.validate_graph_id(p['id'], field='media id')}/insights?metric="
                 + ",".join(IM.media_metrics_for(p.get("media_product_type"))),
             }
             for p in chunk
         ]
         replies = client.post("", batch=json.dumps(batch), include_headers="false").get("data") or []
-        for post, reply in zip(chunk, replies, strict=False):
+        for idx, post in enumerate(chunk):
+            reply = replies[idx] if idx < len(replies) else None
             try:
                 body = json.loads((reply or {}).get("body") or "{}")
-            except ValueError:
+            except (ValueError, TypeError):
+                body = {}
+            if not isinstance(body, dict):
                 body = {}
             if (reply or {}).get("code") != 200 or "error" in body:
-                msg = ((body.get("error") or {}).get("message")) or "insights unavailable"
+                msg = ((body.get("error") or {}).get("message")) or "insights unavailable (no reply from Meta)"
                 errors.append({"id": post["id"], "error": audit.sanitize_error(msg)})
                 continue
-            post["metrics"] = {row["name"]: _metric_value(row) for row in body.get("data", [])}
+            metrics, warnings = SH.media_quality(
+                post.get("media_product_type"), SH.media_metrics(body.get("data") or [])
+            )
+            post["metrics"] = metrics
+            if warnings:
+                post["warnings"] = warnings
     return errors
 
 
@@ -806,11 +979,11 @@ def list_stories(
 def top_posts(
     account: AccountArg = None,
     *,
-    since: Annotated[str | None, Field(description='Start date, e.g. "2026-10-01" (default: 30 days ago).')] = None,
-    until: Annotated[str | None, Field(description='End date (inclusive), e.g. "2026-10-31" (default: now).')] = None,
+    since: Annotated[str | None, Field(description='Start day "YYYY-MM-DD" (default: 30 days ago).')] = None,
+    until: Annotated[str | None, Field(description='End day "YYYY-MM-DD", inclusive (default: now).')] = None,
     metric: Annotated[
         Literal["reach", "views", "likes", "comments", "shares", "saved", "total_interactions"],
-        Field(description="Insight metric used for ranking (highest first)."),
+        Field(description="Metric used for ranking (highest first). likes/comments work for any age of post."),
     ] = "reach",
     n: Annotated[int, Field(description="How many top posts to return, 1-100 (default 10).")] = 10,
     media_type: Annotated[
@@ -818,12 +991,11 @@ def top_posts(
         Field(description="Only rank this kind of post. Optional."),
     ] = None,
 ) -> dict[str, Any]:
-    """Best-performing posts in a date range, ranked by an insight metric.
+    """Best-performing posts in a date range, ranked by a metric.
 
-    since/until: dates like 2026-10-01 (default: last 30 days). metric: reach | views |
-    likes | comments | shares | saved | total_interactions. media_type: optional filter
-    (REELS, IMAGE, VIDEO, CAROUSEL_ALBUM, FEED). Per-post insights are fetched in Graph
-    batch requests (50 posts per call) to save rate limit.
+    likes/comments rank by the counts on every post (no insight calls, any date range).
+    reach/views/shares/saved/total_interactions need insights (posts from the last
+    2 years; fetched in batches of 50). Posts whose reach Meta under-reports get a warning.
     """
 
     def _impl() -> dict[str, Any]:
@@ -833,7 +1005,8 @@ def top_posts(
         if metric not in SORT_METRICS:
             raise V.ValidationError(f"metric must be one of {sorted(SORT_METRICS)}")
         top_n = V.validate_limit(n, field="n", default=10, ceiling=100)
-        start, end = _resolve_range(since, until)
+        by_count = metric in COUNT_METRICS
+        start, end = _resolve_range(since, until, allow_old=by_count)
         if start is None:
             end = _utcnow()
             start = end - timedelta(days=30)
@@ -843,20 +1016,34 @@ def top_posts(
             ts = item.get("timestamp")
             return bool(ts and V.parse_graph_time(ts) < start)
 
-        posts, _ = client.paginate(f"{acct.ig_user_id}/media", fields=MEDIA_FIELDS, max_items=CEIL_MEDIA, stop=too_old)
-        posts = [p for p in posts if p.get("timestamp") and V.parse_graph_time(p["timestamp"]) < end]
+        def too_new(item):
+            ts = item.get("timestamp")
+            return bool(ts and V.parse_graph_time(ts) >= end)
+
+        posts, _ = client.paginate(
+            f"{acct.ig_user_id}/media", fields=MEDIA_FIELDS, max_items=CEIL_MEDIA, stop=too_old, skip=too_new
+        )
+        posts = [p for p in posts if p.get("timestamp")]
         if kind:
             posts = [
                 p
                 for p in posts
                 if kind in {(p.get("media_product_type") or "").upper(), (p.get("media_type") or "").upper()}
             ]
-        errors = _batch_media_insights(client, posts)
-        ranked = sorted(
-            (p for p in posts if "metrics" in p), key=lambda p: p["metrics"].get(metric) or -1, reverse=True
-        )[:top_n]
-        result = [
-            {
+        errors: list[dict[str, Any]] = []
+        if by_count:
+            field = COUNT_METRICS[metric]
+            for p in posts:
+                p["metrics"] = {"likes": p.get("like_count"), "comments": p.get("comments_count")}
+            ranked = sorted(posts, key=lambda p: p.get(field) or 0, reverse=True)[:top_n]
+        else:
+            errors = _batch_media_insights(client, posts)
+            ranked = sorted(
+                (p for p in posts if "metrics" in p), key=lambda p: p["metrics"].get(metric) or -1, reverse=True
+            )[:top_n]
+        result = []
+        for p in ranked:
+            item = {
                 "id": p["id"],
                 "timestamp": p.get("timestamp"),
                 "permalink": p.get("permalink"),
@@ -865,14 +1052,15 @@ def top_posts(
                 "caption": (p.get("caption") or "")[:120],
                 "metrics": p["metrics"],
             }
-            for p in ranked
-        ]
+            if p.get("warnings"):
+                item["warnings"] = p["warnings"]
+            result.append(item)
         out: dict[str, Any] = {
             "ok": True,
             "account": acct.label,
             "metric": metric,
-            "since": start.isoformat(),
-            "until": end.isoformat(),
+            "since": SH.pacific_today(start).isoformat(),
+            "until": SH.pacific_today(end - timedelta(seconds=1)).isoformat(),
             "posts_considered": len(posts),
             "posts": result,
         }
@@ -893,14 +1081,14 @@ def insights_summary(
     *,
     period: Annotated[
         Literal["last_7_days", "last_30_days", "last_90_days"],
-        Field(description="Period to summarise; it is compared with the same-length period before it."),
+        Field(description="Period to summarise; it is compared with the same-length period right before it."),
     ] = "last_30_days",
 ) -> dict[str, Any]:
-    """Account totals for a recent period compared with the period before it.
+    """Account totals for a recent period compared with the period right before it.
 
-    period: last_7_days | last_30_days | last_90_days. Returns views, reach,
-    accounts_engaged, total_interactions, profile_views for both periods, % change,
-    current follower count and new followers (last 30 days max).
+    Periods are whole Pacific-time days ending yesterday and never overlap. Returns views,
+    reach, accounts_engaged, total_interactions, profile_views for both periods, % change
+    (null when either side has no real data), current followers and new followers.
     """
 
     def _impl() -> dict[str, Any]:
@@ -910,43 +1098,46 @@ def insights_summary(
         if period not in SUMMARY_PERIODS:
             raise V.ValidationError(f"period must be one of {sorted(SUMMARY_PERIODS)}")
         days = SUMMARY_PERIODS[period]
-        today = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-        cur = (today - timedelta(days=days), today)
-        prev = (today - timedelta(days=2 * days), cur[0])
-        cur_rows, errs1, notes = _account_insights_range(client, acct, ["follower_count"], list(SUMMARY_TOTALS), *cur)
-        prev_rows, errs2, _ = _account_insights_range(client, acct, [], list(SUMMARY_TOTALS), *prev)
-
-        def totals(rows):
-            return {r["name"]: r["total_value"]["value"] for r in rows if "total_value" in r}
-
-        current, previous = totals(cur_rows), totals(prev_rows)
-        change = {
-            k: (round((current[k] - previous[k]) / previous[k] * 100, 1) if previous.get(k) else None)
-            for k in current
-            if k in previous
-        }
-        fc = next((r for r in cur_rows if r["name"] == "follower_count"), None)
-        new_followers = sum(v.get("value") or 0 for v in (fc or {}).get("values", [])) if fc else None
+        today = SH.pacific_today(_utcnow())
+        cur_days = (today - timedelta(days=days), today)  # [start, end)
+        prev_days = (today - timedelta(days=2 * days), cur_days[0])
+        cur = _account_insights_range(
+            client, acct, ["follower_count"], list(SUMMARY_TOTALS), *(SH.pacific_midnight(d) for d in cur_days)
+        )
+        prev = _account_insights_range(
+            client, acct, [], list(SUMMARY_TOTALS), *(SH.pacific_midnight(d) for d in prev_days)
+        )
+        current, previous = cur["totals"], prev["totals"]
+        change: dict[str, Any] = {}
+        for k in SUMMARY_TOTALS:
+            a, b = current.get(k), previous.get(k)
+            complete = k not in cur["incomplete"] and k not in prev["incomplete"]
+            change[k] = round((a - b) / b * 100, 1) if (complete and a is not None and b) else None
+        fc = cur["series"].get("follower_count")
+        new_followers = sum(v.get("value") or 0 for v in fc) if fc else None
         profile = client.get(acct.ig_user_id, fields="followers_count")
         out: dict[str, Any] = {
             "ok": True,
             "account": acct.label,
             "period": period,
-            "current_range": [cur[0].date().isoformat(), cur[1].date().isoformat()],
-            "previous_range": [prev[0].date().isoformat(), prev[1].date().isoformat()],
+            "current_range": [cur_days[0].isoformat(), (cur_days[1] - timedelta(days=1)).isoformat()],
+            "previous_range": [prev_days[0].isoformat(), (prev_days[1] - timedelta(days=1)).isoformat()],
             "current": current,
             "previous": previous,
             "change_pct": change,
             "followers_now": profile.get("followers_count"),
             "new_followers": new_followers,
         }
+        unavailable = {**prev["unavailable"], **cur["unavailable"]}
+        if unavailable:
+            out["unavailable"] = unavailable
         if days > 30:
             out["note"] = (
                 "reach and accounts_engaged are summed over 30-day windows and may count the "
                 "same person more than once; new_followers covers the last 30 days only."
             )
-        if errs1 or errs2:
-            out["errors"] = errs1 + errs2
+        if cur["errors"] or prev["errors"]:
+            out["errors"] = cur["errors"] + prev["errors"]
         return out
 
     return _guard("insights_summary", {"account": account, "period": period}, _impl)
@@ -961,28 +1152,40 @@ def get_media_insights(
         str | None,
         Field(description="Comma-separated metric names to override the automatic per-type defaults. Optional."),
     ] = None,
+    raw: RawArg = False,
 ) -> dict[str, Any]:
-    """Per-post analytics. Picks the right default metrics for the post type.
+    """Per-post analytics as flat numbers, with the right metrics for the post type.
 
     Feed posts/carousels: reach, likes, comments, shares, saved, total_interactions, views.
     Reels add ig_reels_avg_watch_time + ig_reels_video_view_total_time. Stories: reach,
-    views, replies, shares, total_interactions. Pass `metrics` (comma-separated) to override.
+    views, replies, shares, total_interactions. `warnings` flags values Meta under-reports
+    (e.g. reach on older reels). Very old posts (before the business account) have no insights.
     """
 
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         mid = V.validate_graph_id(media_id, field="media_id")
-        product = None
-        if metrics:
+        info = client.get(mid, fields="media_product_type,media_type")
+        product = info.get("media_product_type")
+        if metrics is not None:
             names = IM.parse_metric_list(metrics, ())
+            if not names:
+                raise V.ValidationError("metrics must name at least one metric")
         else:
-            info = client.get(mid, fields="media_product_type,media_type")
-            product = info.get("media_product_type")
             names = list(IM.media_metrics_for(product))
         data = client.get(f"{mid}/insights", metric=",".join(names))
-        out: dict[str, Any] = {"ok": True, "account": acct.label, "media_id": mid, "insights": data.get("data", [])}
-        if product:
-            out["media_product_type"] = product
+        values, warnings = SH.media_quality(product, SH.media_metrics(data.get("data") or []))
+        out: dict[str, Any] = {
+            "ok": True,
+            "account": acct.label,
+            "media_id": mid,
+            "media_product_type": product,
+            "metrics": values,
+        }
+        if warnings:
+            out["warnings"] = warnings
+        if raw:
+            out["raw"] = data.get("data", [])
         return out
 
     return _guard("get_media_insights", {"media_id": media_id, "account": account, "metrics": metrics}, _impl)
@@ -991,8 +1194,7 @@ def get_media_insights(
 AUDIENCE_HINT = (
     "Meta returns this when demographics are unavailable: the account needs "
     ">=100 followers, and only one breakdown per request is allowed. Try a single "
-    "breakdown (age|gender|country|city) or, for engaged_audience_demographics, a "
-    "timeframe (this_week|this_month)."
+    "breakdown (age|gender|country|city)."
 )
 
 
@@ -1011,23 +1213,23 @@ def get_audience_insights(
     ] = "age,gender,country,city",
     timeframe: Annotated[
         Literal["this_week", "this_month"] | None,
-        Field(description="Time window, needed for engaged_audience_demographics. Optional."),
+        Field(description="Time window for engaged_audience_demographics (default this_month)."),
     ] = None,
+    raw: RawArg = False,
 ) -> dict[str, Any]:
-    """Follower demographics by age, gender, country and city.
+    """Follower demographics by age, gender, country and city, largest first with percentages.
 
-    Meta allows ONE breakdown per request, so each breakdown in `breakdown`
-    (comma-separated, default all four) is fetched separately and merged into
-    `breakdowns: {age: ..., gender: ...}`. metric: follower_demographics (default) or
-    engaged_audience_demographics (pass timeframe=this_week|this_month for that one).
-    Needs >=100 followers (Meta privacy floor).
+    Returns breakdowns: {country: [{key, value, percent}, ...], ...}. Meta allows one
+    breakdown per request, so each is fetched separately. Needs >=100 followers.
     """
 
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
         m = metric or IM.DEFAULT_AUDIENCE_METRIC
+        tf = timeframe or ("this_month" if m == "engaged_audience_demographics" else None)
         dims = IM.parse_metric_list(breakdown, IM.AUDIENCE_BREAKDOWNS)
         result: dict[str, Any] = {}
+        raw_rows: dict[str, Any] = {}
         errors: list[dict[str, Any]] = []
         for dim in dims:
             params: dict[str, Any] = {
@@ -1035,10 +1237,12 @@ def get_audience_insights(
                 "period": "lifetime",
                 "metric_type": "total_value",
                 "breakdown": dim,
-                "timeframe": timeframe,
+                "timeframe": tf,
             }
             try:
-                result[dim] = client.get(f"{acct.ig_user_id}/insights", **params).get("data", [])
+                rows = client.get(f"{acct.ig_user_id}/insights", **params).get("data", [])
+                result[dim] = SH.audience_breakdown(rows)
+                raw_rows[dim] = rows
             except graph_client.GraphAPIError as exc:
                 errors.append(
                     {"breakdown": dim, "error": audit.sanitize_error(str(exc)), "error_class": exc.error_class}
@@ -1054,9 +1258,13 @@ def get_audience_insights(
                 "hint": AUDIENCE_HINT,
             }
         out: dict[str, Any] = {"ok": True, "account": acct.label, "metric": m, "breakdowns": result}
+        if tf:
+            out["timeframe"] = tf
         if errors:
             out["errors"] = errors
             out["hint"] = AUDIENCE_HINT
+        if raw:
+            out["raw"] = raw_rows
         return out
 
     return _guard("get_audience_insights", {"account": account, "metric": metric, "breakdown": breakdown}, _impl)
@@ -1425,7 +1633,10 @@ def get_comments(
         items, cursor = client.paginate(f"{mid}/comments", fields=fields, max_items=lim, after=V.validate_cursor(after))
         out = _paged({"ok": True, "account": acct.label, "media_id": mid}, items, cursor, "comments")
         if include_replies:
-            out["reply_count"] = sum(len((c.get("replies") or {}).get("data") or []) for c in items)
+            for c in items:
+                if isinstance(c.get("replies"), dict):
+                    c["replies"] = c["replies"].get("data") or []
+            out["reply_count"] = sum(len(c.get("replies") or []) for c in items)
         return out
 
     return _guard("get_comments", {"media_id": media_id, "account": account, "limit": limit}, _impl)
@@ -1533,7 +1744,11 @@ def search_hashtag(
     ],
     account: AccountArg = None,
 ) -> dict[str, Any]:
-    """Resolve a hashtag name to its Graph id (needed before get_hashtag_media)."""
+    """Resolve a hashtag name to its Graph id (needed before get_hashtag_media).
+
+    Requires Meta's "Instagram Public Content Access" feature (granted via App Review);
+    without it Meta refuses the call.
+    """
 
     def _impl() -> dict[str, Any]:
         client, acct = auth.client_for(account)
@@ -1557,6 +1772,8 @@ def get_hashtag_media(
     after: AfterArg = None,
 ) -> dict[str, Any]:
     """Recent or top media for a hashtag id. edge=top_media|recent_media. limit 1-1000 or "all".
+
+    Requires Meta's "Instagram Public Content Access" feature (App Review).
 
     Get the hashtag_id from search_hashtag first. Subject to Meta's 30-unique-hashtags
     per-7-days query limit per account.
@@ -1719,6 +1936,9 @@ def list_conversations(
     ] = None,
 ) -> dict[str, Any]:
     """List Instagram DM conversations (newest first) with participant usernames.
+
+    In Meta's development mode (before App Review) a large inbox makes Meta time out;
+    then pass user_id to fetch one person's conversation directly.
 
     REQUIRES Meta App Review (instagram_manage_messages). limit 1-200 or "all" (default 5).
     Fetched one conversation per request: Meta rejects larger pages with

@@ -16,7 +16,7 @@ def test_get_comments_include_replies_expands_field(account):
     assert res["ok"] is True, res
     fields = account.calls("GET", r"^/555/comments$")[0].params["fields"]
     assert "replies{" in fields
-    assert res["comments"][0]["replies"]["data"][0]["id"] == "r1"
+    assert res["comments"][0]["replies"][0]["id"] == "r1"
     assert res["reply_count"] == 1
 
 
@@ -51,7 +51,7 @@ def test_get_media_includes_carousel_children(account):
     res = call(server.get_media)("777")
     assert res["ok"] is True, res
     assert "children{" in account.calls("GET", r"^/777$")[0].params["fields"]
-    assert [c["id"] for c in res["media"]["children"]["data"]] == ["k1", "k2"]
+    assert [c["id"] for c in res["media"]["children"]] == ["k1", "k2"]
 
 
 def test_list_stories_empty(account):

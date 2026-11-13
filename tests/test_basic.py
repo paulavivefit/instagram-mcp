@@ -232,7 +232,7 @@ def test_graph_success(monkeypatch):
 
 EXPECTED_TOOLS = {
     "healthcheck", "list_accounts", "add_account", "set_default_account",
-    "remove_account", "account_info",
+    "remove_account",
     "get_profile", "list_media", "get_media",
     "get_account_insights", "get_media_insights", "get_audience_insights",
     "publish_image", "publish_video", "publish_reel", "publish_carousel",
@@ -245,7 +245,7 @@ EXPECTED_TOOLS = {
 
 def test_server_tool_registry_complete():
     from instagram_mcp import server
-    assert len(EXPECTED_TOOLS) == 35  # 31 non-DM + 4 DM
+    assert len(EXPECTED_TOOLS) == 34  # 30 non-DM + 4 DM
     missing = [name for name in EXPECTED_TOOLS if not hasattr(server, name)]
     assert not missing, f"server module missing tool functions: {missing}"
     for name in EXPECTED_TOOLS:

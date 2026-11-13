@@ -7,7 +7,7 @@ import asyncio
 import pytest
 
 READ_ONLY = {
-    "healthcheck", "list_accounts", "account_info", "get_profile", "list_media", "get_media",
+    "healthcheck", "list_accounts", "get_profile", "list_media", "get_media",
     "list_stories", "get_account_insights", "get_media_insights", "get_audience_insights",
     "top_posts", "insights_summary", "publishing_limit", "get_comments", "get_comment_replies",
     "search_hashtag", "get_hashtag_media", "get_mentions", "business_discovery",

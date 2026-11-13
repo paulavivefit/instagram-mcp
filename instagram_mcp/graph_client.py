@@ -173,6 +173,10 @@ ERROR_HINTS_BY_SUBCODE = {
     "conversation with people who have no role on the app, and this inbox is too large. "
     "Pass user_id (the person's Instagram-scoped id) to list_conversations to fetch one "
     "conversation directly, or wait for App Review approval (Live mode), which removes the limit.",
+    2108006: "Meta has no insights for this post: it is older than the account's switch to a "
+    "Business/Creator account (or otherwise too old to be covered).",
+    2207013: "No Business/Creator account with that username: it may not exist, be misspelled, "
+    "or be a personal/private account (business_discovery only works for Professional accounts).",
     2207019: "location_id must be the id of a Facebook Page that has a physical address set (a place). "
     "Pages without an address are rejected.",
     2207067: "Meta rejected a parameter for this media type (for example media_type=VIDEO for feed posts, "

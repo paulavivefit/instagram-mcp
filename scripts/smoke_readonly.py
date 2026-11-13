@@ -41,7 +41,6 @@ def main() -> int:
     print(f"Graph API {graph_client.GRAPH_VERSION}\n")
     check("healthcheck", S.healthcheck, summarize=lambda r: f"user={r['live_check'].get('username')}")
     check("list_accounts", S.list_accounts, summarize=lambda r: f"{len(r.get('accounts', []))} accounts")
-    check("account_info", S.account_info)
     check("get_profile", S.get_profile, summarize=lambda r: f"media_count={r['profile'].get('media_count')}")
     media = check("list_media(50)", S.list_media, limit=50, summarize=lambda r: f"{r['count']} posts")
     check("list_media(all)", S.list_media, limit="all", summarize=lambda r: f"{r['count']} posts")
@@ -53,12 +52,12 @@ def main() -> int:
     busiest = max(posts, key=lambda m: m.get("comments_count", 0), default=None)
     if carousel:
         check("get_media(carousel)", S.get_media, carousel["id"],
-              summarize=lambda r: f"{len((r['media'].get('children') or {}).get('data', []))} children")
+              summarize=lambda r: f"{len(r['media'].get('children') or [])} children")
         check("get_media_insights(feed)", S.get_media_insights, carousel["id"],
-              summarize=lambda r: f"{len(r['insights'])} metrics")
+              summarize=lambda r: f"{len(r['metrics'])} metrics")
     if reel:
         check("get_media_insights(reel)", S.get_media_insights, reel["id"],
-              summarize=lambda r: f"{len(r['insights'])} metrics")
+              summarize=lambda r: f"{len(r['metrics'])} metrics")
     if busiest:
         com = check("get_comments(all+replies)", S.get_comments, busiest["id"], limit="all",
                     include_replies=True, summarize=lambda r: f"{r['count']} + {r.get('reply_count')} replies")
@@ -67,9 +66,9 @@ def main() -> int:
             check("get_comment_replies", S.get_comment_replies, parent["id"], limit="all",
                   summarize=lambda r: f"{r['count']} replies")
     check("get_account_insights", S.get_account_insights,
-          summarize=lambda r: f"{len(r['insights'])} metrics, errors={len(r.get('errors', []))}")
+          summarize=lambda r: f"{len(r['metrics'])} metrics, errors={len(r.get('errors', []))}")
     check("get_account_insights(range)", S.get_account_insights, since="2026-08-01", until="2026-10-31",
-          summarize=lambda r: f"{len(r['insights'])} metrics, errors={len(r.get('errors', []))}")
+          summarize=lambda r: f"{len(r['metrics'])} metrics, errors={len(r.get('errors', []))}")
     check("get_audience_insights", S.get_audience_insights,
           summarize=lambda r: f"{sorted(r['breakdowns'])}, errors={len(r.get('errors', []))}")
     check("insights_summary", S.insights_summary, summarize=lambda r: f"followers={r.get('followers_now')}")

@@ -91,7 +91,6 @@ def phase_read(m: MCP, ctx: dict[str, Any]) -> None:
     P = "read"
     m.call(P, "healthcheck", {}, lambda d: f"{d['live_check']['username']} {d['graph_version']} usage={d.get('api_usage', {}).get('max_percent')}%")
     m.call(P, "list_accounts", {}, lambda d: f"{len(d['accounts'])} account(s)")
-    m.call(P, "account_info", {}, lambda d: "ok")
     prof = m.call(P, "get_profile", {}, lambda d: f"media_count={d['profile']['media_count']}")
     ctx["username"] = (prof.get("profile") or {}).get("username")
     allm = m.call(P, "list_media", {"limit": "all"}, lambda d: f"{d['count']} posts")
@@ -108,15 +107,15 @@ def phase_read(m: MCP, ctx: dict[str, Any]) -> None:
     ctx.update(image=image, reel=reel, carousel=carousel, busiest=busiest, media=media)
     if carousel:
         g = m.call(P, "get_media", {"media_id": carousel["id"]},
-                   lambda d: f"{len(d['media']['children']['data'])} children")
-        ctx["carousel_children"] = ((g.get("media") or {}).get("children") or {}).get("data", [])
-        m.call(P, "get_media_insights", {"media_id": carousel["id"]}, lambda d: f"{len(d['insights'])} metrics (FEED)")
+                   lambda d: f"{len(d['media']['children'])} children")
+        ctx["carousel_children"] = (g.get("media") or {}).get("children") or []
+        m.call(P, "get_media_insights", {"media_id": carousel["id"]}, lambda d: f"{len(d['metrics'])} metrics (FEED)")
     if reel:
-        m.call(P, "get_media_insights", {"media_id": reel["id"]}, lambda d: f"{len(d['insights'])} metrics (REELS)")
+        m.call(P, "get_media_insights", {"media_id": reel["id"]}, lambda d: f"{len(d['metrics'])} metrics (REELS)")
     m.call(P, "list_stories", {"include_insights": True}, lambda d: f"{d['count']} live")
-    m.call(P, "get_account_insights", {}, lambda d: f"{len(d['insights'])} metrics, errors={len(d.get('errors', []))}")
+    m.call(P, "get_account_insights", {}, lambda d: f"{len(d['metrics'])} metrics, errors={len(d.get('errors', []))}")
     m.call(P, "get_account_insights", {"since": "2026-07-01", "until": "2026-10-31", "period": "day"},
-           lambda d: f"{len(d['insights'])} metrics, errors={len(d.get('errors', []))}")
+           lambda d: f"{len(d['metrics'])} metrics, errors={len(d.get('errors', []))}")
     m.call(P, "get_audience_insights", {}, lambda d: f"{sorted(d['breakdowns'])}")
     m.call(P, "get_audience_insights", {"metric": "engaged_audience_demographics", "breakdown": "age",
                                         "timeframe": "this_month"}, lambda d: f"{sorted(d['breakdowns'])}")
