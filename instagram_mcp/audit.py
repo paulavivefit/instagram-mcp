@@ -24,8 +24,6 @@ import json
 import os
 import re
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -169,46 +167,3 @@ def record(
     except Exception:
         # Audit must never break the tool call. Silent failure here is acceptable.
         pass
-
-
-@contextmanager
-def timed(tool: str, *, input_payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    """Context manager that records an audit line on __exit__.
-
-    Usage:
-        with timed("list_media", input_payload={...}) as ctx:
-            result = ...
-            ctx["output"] = result   # logged (sanitized)
-            ctx["extra"] = {...}      # optional
-    """
-    start = time.perf_counter()
-    ctx: dict[str, Any] = {
-        "output": None,
-        "token_usage": None,
-        "extra": None,
-        "error_class": None,
-    }
-    try:
-        yield ctx
-    except BaseException as exc:
-        ctx["error_class"] = classify_error(exc)
-        ctx["output"] = {"error": sanitize_error(str(exc))}
-        elapsed_ms = int((time.perf_counter() - start) * 1000)
-        record(
-            tool,
-            execution_time_ms=elapsed_ms,
-            io={"input": input_payload, "output": ctx["output"]},
-            token_usage=ctx["token_usage"],
-            error_class=ctx["error_class"],
-            extra=ctx["extra"],
-        )
-        raise
-    elapsed_ms = int((time.perf_counter() - start) * 1000)
-    record(
-        tool,
-        execution_time_ms=elapsed_ms,
-        io={"input": input_payload, "output": ctx["output"]},
-        token_usage=ctx["token_usage"],
-        error_class=ctx["error_class"],
-        extra=ctx["extra"],
-    )

@@ -21,7 +21,6 @@ HASHTAG_MAX_LEN = 100
 _GRAPH_ID_RE = re.compile(r"^[0-9A-Za-z_]{1,64}$")
 _NUMERIC_ID_RE = re.compile(r"^[0-9]{1,32}$")
 _HASHTAG_RE = re.compile(r"^[0-9A-Za-z_]{1,100}$")
-_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,62}[a-z0-9]$")
 _ACCOUNT_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.]{0,62}$")
 
 
@@ -179,16 +178,6 @@ def validate_username(value: str, *, field: str = "username") -> str:
         raise ValidationError(
             f"{field} must be a valid Instagram username (<=30, letters/digits/._; got {truncate(v, 40)!r})"
         )
-    return v
-
-
-def validate_slug(value: str, *, field: str = "slug") -> str:
-    """A lowercase kebab slug for account labels / saved-config keys."""
-    if value is None or not isinstance(value, str):
-        raise ValidationError(f"{field} must be a string")
-    v = value.strip().lower()
-    if not _SLUG_RE.match(v):
-        raise ValidationError(f"{field} must be a lowercase kebab slug (3-64 chars; got {truncate(v, 40)!r})")
     return v
 
 
