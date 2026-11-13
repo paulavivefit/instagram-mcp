@@ -223,16 +223,21 @@ def add_account(
     """Store an account's token in the secret backend + metadata in accounts.json."""
     if base_host not in graph_client.ALLOWED_HOSTS:
         raise AuthError(f"base_host must be one of {sorted(graph_client.ALLOWED_HOSTS)}")
+    if label == "env":
+        raise AuthError('"env" is reserved for the INSTAGRAM_MCP_ACCESS_TOKEN account; choose another label')
     _secret_set(label, access_token)
     if app_secret:
         _secret_set(f"{label}::secret", app_secret)
     meta = _load_meta()
+    others = [lbl for lbl in meta["accounts"] if lbl != label]
     meta["accounts"][label] = {
         "ig_user_id": ig_user_id,
         "base_host": base_host,
         "app_secret": bool(app_secret),
     }
-    if make_default or meta.get("default") is None:
+    # Never silently take over: only the very first account (with no env account active)
+    # becomes the default automatically.
+    if make_default or (meta.get("default") is None and not others and not os.environ.get(ENV_TOKEN)):
         meta["default"] = label
     _save_meta(meta)
     return {
@@ -252,7 +257,9 @@ def remove_account(label: str) -> dict[str, Any]:
     if existed:
         del meta["accounts"][label]
     if meta.get("default") == label:
-        meta["default"] = next(iter(meta["accounts"]), None)
+        # keep a default only when it is unambiguous (exactly one account left)
+        remaining = list(meta["accounts"])
+        meta["default"] = remaining[0] if len(remaining) == 1 else None
     _save_meta(meta)
     return {"label": label, "removed": existed, "default": meta.get("default")}
 
@@ -285,6 +292,11 @@ def resolve(label: str | None = None) -> ResolvedAccount:
     if not target:
         if os.environ.get(ENV_TOKEN):
             return resolve("env")
+        if meta["accounts"]:
+            raise AuthError(
+                "several accounts are configured but none is the default; pass account=<label> "
+                "or call set_default_account"
+            )
         raise AuthError("no account configured — set INSTAGRAM_MCP_ACCESS_TOKEN or call add_account")
     info = meta["accounts"].get(target)
     if not info:

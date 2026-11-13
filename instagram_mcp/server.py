@@ -179,6 +179,9 @@ def _guard(tool: str, input_payload: dict[str, Any], impl: Any) -> dict[str, Any
         if error_class == "oauth":
             _PAGE_CACHE.clear()  # a revoked/expired token must not stay cached
         out = {"ok": False, "error": message, "error_class": error_class}
+        for attr in ("code", "subcode"):
+            if isinstance(getattr(exc, attr, None), int):
+                out[attr] = getattr(exc, attr)
         extra = getattr(exc, "extra", None)
         if isinstance(extra, dict):
             out.update({k: v for k, v in extra.items() if k not in out})
@@ -261,12 +264,17 @@ def _wait_container_ready(
     wait = VIDEO_WAIT_S if timeout_s is None else timeout_s
     deadline = time.monotonic() + wait
     while True:
-        status = client.get(container_id, fields="status_code,status")
+        try:
+            status = client.get(container_id, fields="status_code,status")
+        except graph_client.GraphAPIError as exc:
+            raise _rewrap(exc, container_id=container_id, hint=PUBLISH_LATER_HINT) from exc
         code = status.get("status_code")
-        if code == "FINISHED":
+        if code in ("FINISHED", "PUBLISHED"):
             return
         if code == "ERROR":
             raise _processing_error(container_id, status)
+        if code == "EXPIRED":
+            raise _expired_error(container_id)
         if time.monotonic() + interval_s > deadline:
             raise graph_client.GraphAPIError(
                 f"media container {container_id} not ready after {wait}s",
@@ -274,6 +282,38 @@ def _wait_container_ready(
                 extra={"container_id": container_id, "status_code": code, "hint": PUBLISH_LATER_HINT},
             )
         time.sleep(interval_s)
+
+
+def _rewrap(
+    exc: graph_client.GraphAPIError, *, hint: str | None = None, error_class: str | None = None, **extra: Any
+) -> graph_client.GraphAPIError:
+    """Copy a GraphAPIError keeping code/subcode/status and Meta's specific hint first."""
+    merged = dict(exc.extra or {})
+    for key, value in extra.items():
+        merged.setdefault(key, value)
+    if hint:
+        merged["hint"] = f"{merged['hint']} {hint}" if merged.get("hint") else hint
+    return graph_client.GraphAPIError(
+        str(exc),
+        error_class=error_class or exc.error_class,
+        code=exc.code,
+        subcode=exc.subcode,
+        type_=exc.type,
+        http_status=exc.http_status,
+        transient=exc.transient,
+        extra=merged,
+    )
+
+
+def _expired_error(container_id: str) -> graph_client.GraphAPIError:
+    return graph_client.GraphAPIError(
+        f"media container {container_id} has expired (containers live about 24 hours)",
+        error_class="expired",
+        extra={
+            "container_id": container_id,
+            "hint": "Nothing was published. Run the publish tool again to upload the media anew.",
+        },
+    )
 
 
 PUBLISH_UNCERTAIN_HINT = (
@@ -310,14 +350,7 @@ def _publish_container(
                 "publish_container(container_id) to retry without re-uploading."
             )
         )
-        raise graph_client.GraphAPIError(
-            str(exc),
-            error_class=exc.error_class,
-            code=exc.code,
-            subcode=exc.subcode,
-            http_status=exc.http_status,
-            extra={"container_id": container_id, "hint": hint},
-        ) from exc
+        raise _rewrap(exc, container_id=container_id, hint=hint) from exc
     return {"ok": True, "media_id": published.get("id"), "container_id": container_id}
 
 
@@ -1313,8 +1346,18 @@ def publish_container(
         code = status.get("status_code")
         if code == "FINISHED":
             return {"account": acct.label, **_publish_container(client, acct.ig_user_id, cid)}
+        if code == "PUBLISHED":
+            return {
+                "ok": True,
+                "account": acct.label,
+                "container_id": cid,
+                "already_published": True,
+                "hint": "This container was already published; check list_media for the post.",
+            }
         if code == "ERROR":
             raise _processing_error(cid, status)
+        if code == "EXPIRED":
+            raise _expired_error(cid)
         return {
             "ok": False,
             "account": acct.label,
@@ -1539,15 +1582,20 @@ def publish_carousel(
             try:
                 _wait_container_ready(client, vid)
             except graph_client.GraphAPIError as exc:
+                specific = (exc.extra or {}).get("hint")
+                carousel_hint = (
+                    "A carousel video is still processing (or failed); nothing was published. Run "
+                    "publish_carousel again later (carousel items cannot be published on their own)."
+                )
+                if specific and specific != PUBLISH_LATER_HINT:
+                    carousel_hint = f"{specific} {carousel_hint}"
                 raise graph_client.GraphAPIError(
                     str(exc),
                     error_class=exc.error_class,
-                    extra={
-                        "child_container_ids": child_ids,
-                        "hint": "A carousel video is still processing (or failed); nothing was "
-                        "published. Run publish_carousel again later (carousel items "
-                        "cannot be published on their own).",
-                    },
+                    code=exc.code,
+                    subcode=exc.subcode,
+                    http_status=exc.http_status,
+                    extra={"child_container_ids": child_ids, "hint": carousel_hint},
                 ) from exc
         parent = client.post(
             f"{acct.ig_user_id}/media",
@@ -1878,7 +1926,9 @@ def business_discovery(
         if with_media:
             result["media"] = {"data": posts[:lim]}
         out: dict[str, Any] = {"ok": True, "account": acct.label, "target": uname, "business_discovery": result}
-        if with_media and cursor and len(posts) >= lim:
+        # Meta's nested paging has only cursors (no 'next'), so compare with media_count.
+        total = (profile or {}).get("media_count")
+        if with_media and isinstance(total, int) and len(posts[:lim]) < total:
             out["truncated"] = True
         return out
 
@@ -1916,7 +1966,11 @@ def _page_dm_client(client, acct):
             )
             _PAGE_CACHE[key] = out
             return out
-    raise V.ValidationError("no Facebook Page linked to this Instagram account was found in me/accounts")
+    raise graph_client.GraphAPIError(
+        "no Facebook Page linked to this Instagram account was found in me/accounts",
+        error_class="setup",
+        extra={"hint": "Link the Instagram account to a Facebook Page and grant the token pages_show_list."},
+    )
 
 
 @mcp.tool(annotations={"title": "List DM conversations", "readOnlyHint": True, "openWorldHint": True})
@@ -1979,9 +2033,13 @@ def list_conversations(
                 page = short.get(
                     f"{page_id}/conversations", platform="instagram", fields="id,updated_time", limit=1, after=nxt
                 )
-            except Exception:
-                nxt = None
-                note = "stopped early: Meta did not return more conversations (normal in development mode)"
+            except graph_client.GraphAPIError as exc:
+                # keep nxt: the caller can resume from this cursor later
+                note = (
+                    "stopped early: Meta timed out (development-mode limit); continue with next_cursor or pass user_id"
+                    if exc.error_class == "dev_mode_limit"
+                    else f"stopped early ({exc.error_class}); continue later with next_cursor"
+                )
                 break
         items = items[:lim]
         for c in items:

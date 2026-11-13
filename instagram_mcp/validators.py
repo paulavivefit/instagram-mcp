@@ -288,6 +288,10 @@ def validate_date(value: str | None, *, field: str = "date", end_of_day: bool = 
     if not isinstance(value, str):
         raise ValidationError(f"{field} must be a date string like 2026-11-01")
     v = value.strip()
+    if not (re.fullmatch(r"\d{4}-\d{2}-\d{2}", v) or re.match(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}", v)):
+        raise ValidationError(
+            f"{field} must be a date like 2026-11-01 or a full ISO date-time (got {truncate(v, 30)!r})"
+        )
     try:
         if len(v) == 10:
             d = datetime.strptime(v, "%Y-%m-%d").date()
