@@ -57,9 +57,13 @@ class SeenRequest:
     path: str
     params: dict[str, str]
     form: dict[str, str]
+    headers: dict[str, str] = field(default_factory=dict)
 
     @property
     def token(self) -> str | None:
+        auth = self.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            return auth[7:]
         return self.params.get("access_token")
 
 
@@ -84,7 +88,7 @@ class FakeGraph:
         path = re.sub(r"^/v\d+\.\d+", "", request.url.path)
         params = dict(request.url.params)
         form = dict(parse_qsl(request.content.decode())) if request.content else {}
-        seen = SeenRequest(request.method, path, params, form)
+        seen = SeenRequest(request.method, path, params, form, {k.lower(): v for k, v in request.headers.items()})
         self.requests.append(seen)
         for method, rx, responder in self.routes:
             if method == request.method and rx.search(path):

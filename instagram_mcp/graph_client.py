@@ -24,6 +24,7 @@ import contextlib
 import hashlib
 import hmac
 import ipaddress
+import logging
 import os
 import random
 import socket
@@ -46,6 +47,15 @@ THROTTLE_CODES = frozenset({4, 17, 32, 613, 80002})
 TOKEN_ERROR_CODES = frozenset({190, 102, 463, 467})  # invalid / expired / session errors
 
 _sleep = time.sleep  # patched in tests
+
+# httpx logs full request URLs at INFO; keep it quiet even if a host enables INFO logging.
+for _name in ("httpx", "httpcore"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
+
+UNCERTAIN_WRITE_HINT = (
+    "The request may have gone through even though no confirmation arrived. Check the result "
+    "(e.g. the comment thread or conversation) before retrying, to avoid a duplicate."
+)
 
 # One pooled httpx.Client per (timeout, transport): keeps TCP/TLS connections alive
 # across requests and tool calls instead of a new handshake for every call.
@@ -179,6 +189,8 @@ def _map_graph_error(payload: dict[str, Any], http_status: int) -> GraphAPIError
     if code == 100:
         # 100 is "invalid parameter" UNLESS it's the missing-permission subcode family.
         error_class = "invalid_param"
+    if isinstance(message, str) and "reduce the amount of data" in message.lower():
+        error_class = "too_much_data"
     if subcode == 2534084 or (code == -2 and str(message).strip().lower() == "timeout"):
         # Development mode: Meta must skip conversations with people who have no app role,
         # and a large inbox makes that query time out. Not a token problem.
@@ -189,6 +201,9 @@ def _map_graph_error(payload: dict[str, Any], http_status: int) -> GraphAPIError
     if http_status == 404:
         error_class = "not_found"
 
+    hint = _error_hint(subcode if isinstance(subcode, int) else None, message)
+    if error_class == "too_much_data" and not hint:
+        hint = {"hint": "Meta refused the size of this request; ask for fewer items or fields (smaller limit)."}
     return GraphAPIError(
         message if isinstance(message, str) else str(message),
         error_class=error_class,
@@ -197,14 +212,15 @@ def _map_graph_error(payload: dict[str, Any], http_status: int) -> GraphAPIError
         type_=etype if isinstance(etype, str) else None,
         http_status=http_status,
         transient=bool(err.get("is_transient")),
-        extra=_error_hint(subcode if isinstance(subcode, int) else None, message),
+        extra=hint,
     )
 
 
 ERROR_HINTS_BY_SUBCODE = {
     2207018: "Instagram could not find that user. People in user_tags and collaborators must be existing "
     "PUBLIC Instagram accounts (private accounts cannot be tagged via the API); check the spelling.",
-    2534084: "Meta timed out listing conversations: in development mode it has to skip every "
+    2534084: "Meta could not list conversations (timeout or 'reduce the amount of data'): in development "
+    "mode it has to skip every "
     "conversation with people who have no role on the app, and this inbox is too large. "
     "Pass user_id (the person's Instagram-scoped id) to list_conversations to fetch one "
     "conversation directly, or wait for App Review approval (Live mode), which removes the limit.",
@@ -327,7 +343,9 @@ class GraphClient:
         ).hexdigest()
 
     def _auth_params(self) -> dict[str, str]:
-        params = {"access_token": self._token}
+        # The token travels in the Authorization header (verified live), never in the URL,
+        # so it cannot end up in request logs. appsecret_proof is a hash, not a secret.
+        params: dict[str, str] = {}
         proof = self._appsecret_proof()
         if proof:
             params["appsecret_proof"] = proof
@@ -357,21 +375,30 @@ class GraphClient:
             can_retry = attempt < (self._max_attempts or MAX_ATTEMPTS)
             try:
                 client = _shared_client(self._timeout, self._transport or DEFAULT_TRANSPORT)
-                resp = client.request(method, url, params=query, data=data)
+                resp = client.request(
+                    method, url, params=query, data=data, headers={"Authorization": f"Bearer {self._token}"}
+                )
             except httpx.TimeoutException as exc:
                 # A timed-out POST may have been processed (published/sent): never repeat it.
                 if method == "GET" and can_retry:
                     _sleep(_backoff(attempt))
                     continue
                 raise GraphAPIError(
-                    f"Graph API request timed out after {self._timeout}s", error_class="timeout"
+                    f"Graph API request timed out after {self._timeout}s",
+                    error_class="timeout",
+                    extra={"hint": UNCERTAIN_WRITE_HINT, "uncertain": True} if method != "GET" else None,
                 ) from exc
             except httpx.HTTPError as exc:
                 # A connect error means nothing was sent, so any method is safe to retry.
                 if can_retry and (method == "GET" or isinstance(exc, httpx.ConnectError)):
                     _sleep(_backoff(attempt))
                     continue
-                raise GraphAPIError(f"Graph API transport error: {exc}", error_class="network") from exc
+                uncertain = method != "GET" and not isinstance(exc, httpx.ConnectError)
+                raise GraphAPIError(
+                    f"Graph API transport error: {type(exc).__name__}",
+                    error_class="network",
+                    extra={"hint": UNCERTAIN_WRITE_HINT, "uncertain": True} if uncertain else None,
+                ) from exc
 
             _record_usage(getattr(resp, "headers", None))
             try:
@@ -389,10 +416,15 @@ class GraphClient:
                 retry_after = _retry_after(getattr(resp, "headers", None))
                 # Only short bursts are worth waiting for; hourly limits (4/17/32/80002) fail fast.
                 burst = err.code == 613 or (resp.status_code == 429 and retry_after is not None)
-                server_side = (resp.status_code >= 500 or err.transient) and err.error_class != "dev_mode_limit"
+                server_side = (resp.status_code >= 500 or err.transient) and err.error_class not in {
+                    "dev_mode_limit",
+                    "too_much_data",
+                }
                 if can_retry and (burst or (method == "GET" and server_side)):
                     _sleep(retry_after or _backoff(attempt))
                     continue
+                if method != "GET" and resp.status_code >= 500:
+                    err.extra = {**(err.extra or {}), "hint": UNCERTAIN_WRITE_HINT, "uncertain": True}
                 if err.error_class == "rate_limited" and not burst:
                     pct = LAST_USAGE.get("max_percent")
                     usage = f" (current usage {pct}%)" if pct is not None else ""

@@ -19,6 +19,7 @@ the zero-vector; the field is retained for cross-MCP audit-schema parity.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -116,7 +117,10 @@ def _audit_path() -> Path:
 
 
 def _ensure_dir() -> None:
-    _audit_path().parent.mkdir(parents=True, exist_ok=True)
+    parent = _audit_path().parent
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(parent, 0o700)
 
 
 def _rotate(path: Path) -> None:
@@ -157,7 +161,10 @@ def record(
         _ensure_dir()
         path = _audit_path()
         _rotate(path)
-        with path.open("a", encoding="utf-8") as f:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with contextlib.suppress(OSError):
+            os.fchmod(fd, 0o600)  # also tighten files created by older versions
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception:
         # Audit must never break the tool call. Silent failure here is acceptable.
