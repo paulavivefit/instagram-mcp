@@ -4,7 +4,7 @@
 
 An [MCP](https://modelcontextprotocol.io) server for the **official Instagram Graph API**. Read, publish, comment, and pull analytics across one or many Instagram **Business/Creator** accounts from Claude (or any MCP client) — ToS-safe, no private/reverse-engineered API.
 
-35 tools across accounts, media, publishing, insights, comments, discovery, and (review-gated) direct messages.
+34 tools across accounts, media, publishing, insights, comments, discovery, and (review-gated) direct messages.
 
 ```
 npx-style stdio MCP · Python · FastMCP · MIT
@@ -59,7 +59,7 @@ Or skip the env vars and call `add_account` at runtime (token goes to your OS ke
 
 ## Tools
 
-**Accounts & health** — `healthcheck` (incl. Meta rate-limit usage), `list_accounts`, `add_account`, `set_default_account`, `remove_account`, `account_info`
+**Accounts & health** — `healthcheck` (incl. Meta rate-limit usage), `list_accounts`, `add_account`, `set_default_account`, `remove_account`
 
 **Profile & media** — `get_profile`, `list_media` (`limit` up to 10 000 or `"all"`, `since`/`until` dates, `next_cursor` paging), `get_media` (incl. carousel children), `list_stories` (active stories, optional insights)
 
@@ -73,7 +73,11 @@ Or skip the env vars and call `add_account` at runtime (token goes to your OS ke
 
 **Direct messages** — `list_conversations`, `get_messages` (text, attachments, shares, story replies), `send_message` (text and/or image, optional `HUMAN_AGENT` tag), `mark_seen` (see below)
 
-**Reliability** — automatic retries with backoff for slow or rate-limited Meta responses (a timed-out publish or send is never repeated), 60 s request timeout, 5 min video processing wait. Knobs: `INSTAGRAM_MCP_TIMEOUT`, `INSTAGRAM_MCP_MAX_ATTEMPTS`, `INSTAGRAM_MCP_VIDEO_WAIT_S`, `INSTAGRAM_MCP_GRAPH_VERSION` (default `v27.0`).
+**Reliability and rate limits** — pooled connections; retries with backoff only where they help (timeouts and 5xx on reads, short-burst limits 613/429); Meta's hourly limits fail fast with the current usage % instead of burning more calls, and `limit="all"` is refused above 80 % usage. A write that may have gone through (timeout, 5xx) is never repeated automatically and says so. Video processing is polled with backoff (max 15 polls, 5 min); DM conversation listing uses one 45 s attempt per page and a 90 s budget. Knobs: `INSTAGRAM_MCP_TIMEOUT`, `INSTAGRAM_MCP_MAX_ATTEMPTS`, `INSTAGRAM_MCP_VIDEO_WAIT_S`, `INSTAGRAM_MCP_GRAPH_VERSION` (default `v27.0`).
+
+**Big pulls** — `list_media` / `get_mentions` take `compact=true` (id, date, type, likes, comments, permalink, first 150 caption characters): all ~1800 posts in ~15 s and ~75 % less data. Every list continues with `next_cursor` passed back as `after`, also for date-filtered calls.
+
+**Security** — the token travels in the `Authorization` header (never in URLs or logs), keychain writes go through stdin (never in the process list), `accounts.json`, the token fallback file and the audit log are private (0600, rotated at 5 MB). Tools that return other people's text (comments, DMs, captions) mark it as data, not instructions. `add_account` warns that a token typed into the chat is visible there; prefer the env setup for your main account.
 
 **Review before posting** — every `publish_*` tool takes `prepare_only=true`: Instagram downloads and processes the post (and validates tags, collaborators, location) but nothing is published; call `publish_container(container_id)` within ~24 h to publish it.
 

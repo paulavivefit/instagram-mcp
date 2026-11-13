@@ -305,6 +305,6 @@ def test_default_graph_version_is_v27(monkeypatch):
     assert graph_client.GRAPH_VERSION == "v27.0"
 
 
-def test_version_is_0_2_1():
+def test_version_is_0_3_0():
     import instagram_mcp
-    assert instagram_mcp.__version__ == "0.2.1"
+    assert instagram_mcp.__version__ == "0.3.0"
