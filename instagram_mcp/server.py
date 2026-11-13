@@ -105,6 +105,27 @@ MEDIA_FIELDS = (
     "id,caption,media_type,media_product_type,media_url,permalink,"
     "thumbnail_url,timestamp,username,like_count,comments_count"
 )
+COMPACT_MEDIA_FIELDS = "id,timestamp,media_type,media_product_type,like_count,comments_count,permalink,caption"
+COMPACT_CAPTION_CHARS = 150
+
+
+def _compact_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Shorten captions for compact output (full text stays available via get_media)."""
+    for it in items:
+        cap = it.get("caption")
+        if isinstance(cap, str) and len(cap) > COMPACT_CAPTION_CHARS:
+            it["caption"] = cap[:COMPACT_CAPTION_CHARS] + "…"
+            it["caption_truncated"] = True
+    return items
+
+
+CompactArg = Annotated[
+    bool,
+    Field(
+        description="True for analysis of many posts: only id, date, type, likes, comments, permalink and "
+        "the first 150 caption characters (no media URLs). Use get_media for a full caption."
+    ),
+]
 COMMENT_FIELDS = "id,text,username,timestamp,like_count,hidden"
 REPLIES_PAGE = 50
 COMMENT_WITH_REPLIES_FIELDS = COMMENT_FIELDS + f",replies.limit({REPLIES_PAGE}){{" + COMMENT_FIELDS + "}"
@@ -666,12 +687,15 @@ def list_media(
     until: Annotated[
         str | None, Field(description='Only posts on or before this date, e.g. "2026-10-31" (inclusive). Optional.')
     ] = None,
+    compact: CompactArg = False,
 ) -> dict[str, Any]:
     """List the account's posts/reels, newest first.
 
-    limit: 1-10000 or "all" (default 25). since/until: dates like 2026-10-01 (inclusive)
-    to keep only posts in that range. When more posts exist the result has
-    next_cursor; pass it back as `after` to continue.
+    limit: 1-10000 or "all" (default 25). since/until: dates like 2026-10-01 (inclusive,
+    UTC) to keep only posts in that range. When more posts exist the result has
+    next_cursor; pass it back as `after` (with the same since/until) to continue.
+    compact=true drops the long media URLs for analysis of many posts. Some older reels
+    have no media_url at all (Meta, e.g. licensed audio); permalink is always there.
     """
 
     def _impl() -> dict[str, Any]:
@@ -681,6 +705,14 @@ def list_media(
         cur = V.validate_cursor(after)
         start_dt = V.validate_date(since, field="since")
         end_dt = V.validate_date(until, field="until", end_of_day=True)
+        resume = V.parse_until_cursor(cur)
+        if resume is not None:
+            # synthetic cursor from a date-filtered page: continue with posts older than it
+            from datetime import datetime, timezone
+
+            resume_dt = datetime.fromtimestamp(resume - 1, timezone.utc)
+            end_dt = min(end_dt, resume_dt) if end_dt else resume_dt
+            cur = None
         if start_dt and end_dt and start_dt > end_dt:
             raise V.ValidationError("since must be on or before until")
 
@@ -694,22 +726,19 @@ def list_media(
 
         items, cursor = client.paginate(
             f"{acct.ig_user_id}/media",
-            fields=MEDIA_FIELDS,
+            fields=COMPACT_MEDIA_FIELDS if compact else MEDIA_FIELDS,
             max_items=lim,
             after=cur,
             stop=too_old if start_dt else None,
             skip=too_new if end_dt else None,
         )
+        if compact:
+            _compact_items(items)
         if getattr(client, "last_cut", False) and items:
-            from datetime import timedelta
-
+            # A Graph cursor cannot resume mid-page, so hand out a synthetic one that
+            # continues just before the last returned post (same filters).
             last = V.parse_graph_time(items[-1]["timestamp"])
-            out = _paged({"ok": True, "account": acct.label}, items, None, "media")
-            out["truncated"] = True
-            nxt_until = (last - timedelta(seconds=1)).isoformat()
-            out["next_until"] = nxt_until
-            out["hint"] = f"More posts exist. To continue, call list_media again with until={nxt_until!r}."
-            return out
+            return _paged({"ok": True, "account": acct.label}, items, f"until-{int(last.timestamp())}", "media")
         return _paged({"ok": True, "account": acct.label}, items, cursor, "media")
 
     return _guard("list_media", {"account": account, "limit": limit, "since": since, "until": until}, _impl)
@@ -1153,7 +1182,7 @@ def top_posts(
             return bool(ts and V.parse_graph_time(ts) >= end)
 
         posts, _ = client.paginate(
-            f"{acct.ig_user_id}/media", fields=MEDIA_FIELDS, max_items=CEIL_MEDIA, stop=too_old, skip=too_new
+            f"{acct.ig_user_id}/media", fields=COMPACT_MEDIA_FIELDS, max_items=CEIL_MEDIA, stop=too_old, skip=too_new
         )
         posts = [p for p in posts if p.get("timestamp")]
         if kind:
@@ -1973,6 +2002,7 @@ def get_mentions(
         int | str, Field(description='How many posts that tag the account: 1-1000 or "all" (default 25).')
     ] = 25,
     after: AfterArg = None,
+    compact: CompactArg = False,
 ) -> dict[str, Any]:
     """List media where the account is tagged/@-mentioned. limit 1-1000 or "all".
 
@@ -1984,8 +2014,13 @@ def get_mentions(
         client, acct = auth.client_for(account)
         lim = V.validate_limit(limit, ceiling=CEIL_TAGS, all_ceiling=CEIL_TAGS)
         items, cursor = client.paginate(
-            f"{acct.ig_user_id}/tags", fields=MEDIA_FIELDS, max_items=lim, after=V.validate_cursor(after)
+            f"{acct.ig_user_id}/tags",
+            fields=COMPACT_MEDIA_FIELDS if compact else MEDIA_FIELDS,
+            max_items=lim,
+            after=V.validate_cursor(after),
         )
+        if compact:
+            _compact_items(items)
         return _paged({"ok": True, "account": acct.label}, items, cursor, "media")
 
     return _guard("get_mentions", {"account": account, "limit": limit}, _impl)
