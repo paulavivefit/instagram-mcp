@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tests.conftest import FAKE_IG_ID, call
 from tests.test_pagination import _media, _paged
 
 MEDIA = rf"^/{FAKE_IG_ID}/media$"
+
+# Implemented in Stage F (one continuation token + compact mode); strict so a pass is noticed.
+pytestmark = pytest.mark.xfail(reason="Stage F not implemented yet", strict=True)
 
 
 def test_date_filtered_page_continues_with_next_cursor(account):
