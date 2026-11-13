@@ -83,12 +83,19 @@ def _keychain_available() -> bool:
 
 
 def _keychain_set(account: str, secret: str) -> None:
-    subprocess.run(
-        ["security", "add-generic-password", "-U", "-a", account, "-s", KEYCHAIN_SERVICE, "-w", secret],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    """Store via `security -i` reading the command from stdin, so the secret never appears
+    in the process list (argv). Failures raise AuthError without echoing the command."""
+    if any(ch in secret for ch in '"\\\n\r') or any(ch in account for ch in '"\\\n\r'):
+        raise AuthError("token or label contains characters that cannot be stored safely")
+    command = f'add-generic-password -U -a "{account}" -s "{KEYCHAIN_SERVICE}" -w "{secret}"\n'
+    try:
+        res = subprocess.run(["security", "-i"], input=command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        raise AuthError(f"keychain write failed (security exit {exc.returncode}); is the keychain locked?") from None
+    except OSError:
+        raise AuthError("keychain write failed (security command unavailable)") from None
+    if res.returncode != 0:
+        raise AuthError(f"keychain write failed (security exit {res.returncode})")
 
 
 def _keychain_get(account: str) -> str | None:
@@ -119,10 +126,23 @@ def _fallback_load() -> dict[str, str]:
         return {}
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Atomically write a 0600 file (never briefly world-readable) in a 0700 directory."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def _fallback_save(data: dict[str, str]) -> None:
-    TOKENS_FALLBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    TOKENS_FALLBACK_PATH.write_text(json.dumps(data), encoding="utf-8")
-    os.chmod(TOKENS_FALLBACK_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    _write_private(TOKENS_FALLBACK_PATH, json.dumps(data))
 
 
 def _secret_set(account: str, secret: str) -> None:
@@ -172,9 +192,7 @@ def _load_meta() -> dict[str, Any]:
 
 
 def _save_meta(meta: dict[str, Any]) -> None:
-    ACCOUNTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    ACCOUNTS_PATH.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.chmod(ACCOUNTS_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    _write_private(ACCOUNTS_PATH, json.dumps(meta, indent=2, ensure_ascii=False))
 
 
 # --------------------------------------------------------------------------- #
@@ -319,6 +337,8 @@ def _resolve_uncached(label: str | None = None) -> ResolvedAccount:
         if not token:
             raise AuthError(f"{ENV_TOKEN} not set")
         uid = os.environ.get(ENV_IG_USER_ID)
+        if uid and not uid.strip().isdigit():
+            raise AuthError(f"{ENV_IG_USER_ID} must be the numeric Instagram account id")
         if not uid:
             raise AuthError(f"{ENV_IG_USER_ID} must be set alongside {ENV_TOKEN}")
         return ResolvedAccount(

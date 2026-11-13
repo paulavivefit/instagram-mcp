@@ -38,8 +38,10 @@ classifiers = [
     "Topic :: Office/Business",
 ]
 dependencies = [
-    "fastmcp>=3.4.2,<5.0",
+    "fastmcp~=4.1",
     "httpx>=0.27,<1.0",
+    "pydantic>=2.7,<3",
+    "tzdata; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
