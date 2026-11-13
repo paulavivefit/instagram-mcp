@@ -1,13 +1,13 @@
-"""instagram-mcp v0.2.1 — official Instagram Graph API MCP.
+"""instagram-mcp v0.3.0 — official Instagram Graph API MCP.
 
 A self-contained, multi-account wrapper over the OFFICIAL Instagram Graph API
 (graph.facebook.com). Read, publish, comment, and pull analytics for any
 Instagram Professional (Business/Creator) account. ToS-safe — no private API.
 
-Tool surface (35):
+Tool surface (34):
 
-  HEALTH + ACCOUNTS (6)  healthcheck, list_accounts, add_account,
-                         set_default_account, remove_account, account_info
+  HEALTH + ACCOUNTS (5)  healthcheck, list_accounts, add_account,
+                         set_default_account, remove_account
   PROFILE + MEDIA (4)    get_profile, list_media, get_media, list_stories
   INSIGHTS (5)           get_account_insights, get_media_insights,
                          get_audience_insights, top_posts, insights_summary
