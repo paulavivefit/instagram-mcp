@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-import pytest
-
 from tests.conftest import FAKE_IG_ID, call
 from tests.test_pagination import _media, _paged
 
 MEDIA = rf"^/{FAKE_IG_ID}/media$"
 
-# Implemented in Stage F (one continuation token + compact mode); strict so a pass is noticed.
-pytestmark = pytest.mark.xfail(reason="Stage F not implemented yet", strict=True)
 
 
 def test_date_filtered_page_continues_with_next_cursor(account):
@@ -50,3 +46,30 @@ def test_compact_mode_on_mentions(account):
     account.route("GET", rf"^/{FAKE_IG_ID}/tags$", {"data": []})
     call(server.get_mentions)(compact=True)
     assert "media_url" not in account.calls("GET", r"/tags$")[0].params["fields"]
+
+
+def test_synthetic_cursor_format_accepted_and_real_cursor_untouched():
+    from instagram_mcp import validators as V
+    assert V.validate_cursor("until-1780000000") == "until-1780000000"
+    assert V.parse_until_cursor("until-1780000000") == 1780000000
+    assert V.parse_until_cursor("QVFIUmFiY2RlZg==") is None
+
+
+def test_top_posts_uses_compact_fields(account):
+    from instagram_mcp import server
+    account.route("GET", MEDIA, {"data": []})
+    call(server.top_posts)(metric="likes")
+    assert "media_url" not in account.calls("GET", MEDIA)[0].params["fields"]
+
+
+def test_compact_shortens_long_captions(account):
+    from instagram_mcp import server
+    long_cap = "x" * 500
+    account.route("GET", MEDIA, {"data": [{"id": "1", "timestamp": "2026-11-01T10:00:00+0000", "caption": long_cap},
+                                          {"id": "2", "timestamp": "2026-10-31T10:00:00+0000", "caption": "short"}]})
+    res = call(server.list_media)(limit=5, compact=True)
+    a, b = res["media"]
+    assert len(a["caption"]) <= 151 and a["caption_truncated"] is True
+    assert b["caption"] == "short" and "caption_truncated" not in b
+    full = call(server.list_media)(limit=5)
+    assert full["media"][0]["caption"] == long_cap  # full mode untouched

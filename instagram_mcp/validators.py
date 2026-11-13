@@ -268,6 +268,15 @@ def validate_cursor(value: str | None, *, field: str = "after") -> str | None:
     return value.strip()
 
 
+_UNTIL_CURSOR_RE = re.compile(r"^until-(\d{9,11})$")
+
+
+def parse_until_cursor(value: str | None) -> int | None:
+    """Epoch seconds from a synthetic 'until-<epoch>' cursor (date-filtered list_media), else None."""
+    m = _UNTIL_CURSOR_RE.match(value or "")
+    return int(m.group(1)) if m else None
+
+
 def validate_date(value: str | None, *, field: str = "date", end_of_day: bool = False):
     """YYYY-MM-DD or ISO-8601 -> aware UTC datetime. Date-only + end_of_day -> 23:59:59."""
     from datetime import datetime, time, timezone
