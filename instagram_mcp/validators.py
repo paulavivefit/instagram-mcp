@@ -268,13 +268,13 @@ def validate_cursor(value: str | None, *, field: str = "after") -> str | None:
     return value.strip()
 
 
-_UNTIL_CURSOR_RE = re.compile(r"^until-(\d{9,11})$")
+_UNTIL_CURSOR_RE = re.compile(r"^until-(\d{9,11})(?:-(\d{1,30}))?$")
 
 
-def parse_until_cursor(value: str | None) -> int | None:
-    """Epoch seconds from a synthetic 'until-<epoch>' cursor (date-filtered list_media), else None."""
+def parse_until_cursor(value: str | None) -> tuple[int, str | None] | None:
+    """(epoch, last_id) from a synthetic 'until-<epoch>[-<id>]' cursor, else None."""
     m = _UNTIL_CURSOR_RE.match(value or "")
-    return int(m.group(1)) if m else None
+    return (int(m.group(1)), m.group(2)) if m else None
 
 
 def validate_date(value: str | None, *, field: str = "date", end_of_day: bool = False):

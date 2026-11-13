@@ -51,7 +51,8 @@ def test_compact_mode_on_mentions(account):
 def test_synthetic_cursor_format_accepted_and_real_cursor_untouched():
     from instagram_mcp import validators as V
     assert V.validate_cursor("until-1780000000") == "until-1780000000"
-    assert V.parse_until_cursor("until-1780000000") == 1780000000
+    assert V.parse_until_cursor("until-1780000000") == (1780000000, None)
+    assert V.parse_until_cursor("until-1780000000-17895695668004550") == (1780000000, "17895695668004550")
     assert V.parse_until_cursor("QVFIUmFiY2RlZg==") is None
 
 

@@ -179,7 +179,8 @@ def test_insights_summary_compares_with_previous_period(account, frozen_now):
             if req.params.get("metric_type") == "total_value":
                 out.append({"name": m, "total_value": {"value": val}})
             else:
-                out.append({"name": m, "values": [{"value": 5}, {"value": 7}]})
+                from tests.test_user_feedback import _meta_like_daily
+                out.extend(_meta_like_daily(req)["data"])  # one value (=1) per Pacific day
         return {"data": out}
 
     account.route("GET", INSIGHTS, responder)
@@ -189,7 +190,7 @@ def test_insights_summary_compares_with_previous_period(account, frozen_now):
     assert res["current"]["views"] == 300 and res["previous"]["views"] == 150  # 30 days each, no overlap
     assert res["change_pct"]["views"] == 100.0
     assert res["followers_now"] == 5000
-    assert res["new_followers"] == 12
+    assert res["new_followers"] == 30  # exactly the last 30 Pacific days, split across DST
 
 
 def test_insights_summary_rejects_unknown_period(account, frozen_now):

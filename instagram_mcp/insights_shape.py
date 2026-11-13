@@ -51,18 +51,24 @@ def flatten_series(values: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     return out
 
 
+# Metrics Meta did not collect for older periods (live: 0 next to real reach before mid-2025,
+# total_interactions even negative). A 0 for any other metric is treated as a real zero.
+COLLECTION_GAP_METRICS = frozenset({"views", "accounts_engaged", "total_interactions"})
+
+
 def clean_window_totals(window: dict[str, Any], activity: float) -> tuple[dict[str, Any], dict[str, str]]:
     """Null out totals that are not real data for one window.
 
-    A value is unavailable when it is missing or negative, or 0 while `activity` (reach or
-    another non-zero total in the same window) shows the account was active.
+    A value is unavailable when it is missing or negative, or - for metrics with known
+    collection gaps - 0 while `activity` (reach or another non-zero total) shows activity.
     """
     others = [v for v in window.values() if isinstance(v, (int, float)) and v > 0]
     active = activity > 0 or bool(others)
     clean: dict[str, Any] = {}
     unavailable: dict[str, str] = {}
     for name, value in window.items():
-        bad = not isinstance(value, (int, float)) or value < 0 or (value == 0 and active)
+        gap_zero = value == 0 and active and name in COLLECTION_GAP_METRICS
+        bad = not isinstance(value, (int, float)) or value < 0 or gap_zero
         if bad:
             clean[name] = None
             unavailable[name] = UNAVAILABLE_REASON
