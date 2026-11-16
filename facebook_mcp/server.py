@@ -742,6 +742,26 @@ def create_post(
                                   "scheduled_time": scheduled_time, "dry_run": dry_run}, _impl)
 
 
+PHOTO_HINT = (
+    "Facebook could not download this image. Use a direct public https link to a JPG/PNG file "
+    "(not a web page or a thumbnail service that blocks bots), e.g. a file on treningfitness.com."
+)
+
+
+def _photo_call(page: P.Page, fields: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return page.client.post(f"{page.id}/photos", **fields)
+    except graph_client.GraphAPIError as exc:
+        if "image" in str(exc).lower() and "hint" not in exc.extra:
+            exc.extra["hint"] = PHOTO_HINT
+            exc.extra["image_url"] = fields.get("url")
+        raise
+
+
+def _upload_photo(page: P.Page, url: str, upload: dict[str, Any]) -> str:
+    return _photo_call(page, {"url": url, **upload})["id"]
+
+
 @mcp.tool(annotations={"title": "Publish a photo post", **WRITE})
 def create_photo_post(
     image_urls: Annotated[
@@ -768,7 +788,7 @@ def create_photo_post(
             fields = {k: v for k, v in fields.items() if v is not None}
             if dry_run:
                 return _dry(page, f"{page.id}/photos", fields)
-            return _publish_result(page, page.client.post(f"{page.id}/photos", **fields), when)
+            return _publish_result(page, _photo_call(page, fields), when)
         upload = {"published": "false", **({"temporary": "true"} if when is not None else {})}
         feed = {"message": text, **_sched_fields(when)}
         feed = {k: v for k, v in feed.items() if v is not None}
@@ -778,9 +798,15 @@ def create_photo_post(
                 {"method": "POST", "endpoint": f"{page.id}/feed",
                  "fields": {**feed, "attached_media": f"<{len(urls)} uploaded photo ids>"}},
             ])
-        ids = []
-        for u in urls:
-            ids.append(page.client.post(f"{page.id}/photos", url=u, **upload)["id"])
+        ids: list[str] = []
+        try:
+            for u in urls:
+                ids.append(_upload_photo(page, u, upload))
+        except Exception:
+            for fbid in ids:  # don't leave unpublished uploads behind
+                with contextlib.suppress(graph_client.GraphAPIError):
+                    page.client.delete(fbid)
+            raise
         for i, fbid in enumerate(ids):
             feed[f"attached_media[{i}]"] = json.dumps({"media_fbid": fbid})
         out = _publish_result(page, page.client.post(f"{page.id}/feed", **feed), when)

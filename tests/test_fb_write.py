@@ -142,3 +142,13 @@ def test_audit_records_fb_prefix(fb_account, tmp_path):
     call(_srv().create_post)(message="x", dry_run=True)
     lines = (tmp_path / "audit.log.jsonl").read_text().splitlines()
     assert json.loads(lines[-1])["tool"] == "fb.create_post"
+
+
+def test_album_failure_cleans_up_uploaded_photos(fb_account):
+    calls = iter([{"id": "11"}, (400, {"error": {"code": 324, "message": "Missing or invalid image file"}})])
+    fb_account.route("POST", rf"^/{FB_PAGE_ID}/photos$", lambda r: next(calls))
+    fb_account.route("DELETE", r"^/11$", {"success": True})
+    out = call(_srv().create_photo_post)(image_urls=["https://a.pl/1.jpg", "https://b.pl/2.jpg"])
+    assert out["ok"] is False and "download" in out["hint"] and out["image_url"] == "https://b.pl/2.jpg"
+    assert len(fb_account.calls("DELETE", r"^/11$")) == 1
+    assert not fb_account.calls("POST", r"/feed$")
