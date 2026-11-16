@@ -32,7 +32,9 @@ FAKE_PAGE_TOKEN = "EAApagefaketoken0000000000000"
 
 _MODULES = {"instagram_mcp", "instagram_mcp.audit", "instagram_mcp.auth",
             "instagram_mcp.graph_client", "instagram_mcp.validators",
-            "instagram_mcp.server", "instagram_mcp.insights_metrics"}
+            "instagram_mcp.server", "instagram_mcp.insights_metrics",
+            "instagram_mcp.insights_shape", "facebook_mcp", "facebook_mcp.server",
+            "facebook_mcp.pages", "facebook_mcp.metrics"}
 
 
 @pytest.fixture(autouse=True)
@@ -43,6 +45,7 @@ def _isolate_env(tmp_path, monkeypatch):
     monkeypatch.delenv("INSTAGRAM_MCP_ACCESS_TOKEN", raising=False)
     monkeypatch.delenv("INSTAGRAM_MCP_IG_USER_ID", raising=False)
     monkeypatch.delenv("INSTAGRAM_MCP_DM_ENABLED", raising=False)
+    monkeypatch.delenv("FACEBOOK_MCP_ALLOWED_PAGE_IDS", raising=False)
     # never really sleep in tests (retry backoff, video polling)
     import time
     monkeypatch.setattr(time, "sleep", lambda _s: None)
@@ -134,3 +137,22 @@ def dm_account(monkeypatch, account) -> FakeGraph:
 def call(tool: Callable[..., Any]) -> Callable[..., Any]:
     """Call a FastMCP tool's underlying function regardless of wrapper shape."""
     return getattr(tool, "fn", tool)
+
+
+FB_PAGE_ID = "593060474157088"
+FB_PAGE_TOKEN = "EAAfbpagetoken00000000000000000"
+OTHER_PAGE_ID = "186933557996398"
+OTHER_PAGE_TOKEN = "EAAotherpagetoken000000000000000"
+
+
+@pytest.fixture
+def fb_account(monkeypatch, account) -> FakeGraph:
+    """Env account whose token manages the allowed Page plus two forbidden Pages."""
+    monkeypatch.setenv("FACEBOOK_MCP_ALLOWED_PAGE_IDS", FB_PAGE_ID)
+    account.route("GET", r"^/me/accounts$", {"data": [
+        {"id": OTHER_PAGE_ID, "name": "PUMA Klub Fitness", "access_token": OTHER_PAGE_TOKEN, "tasks": ["MANAGE"]},
+        {"id": FB_PAGE_ID, "name": "Trening Fitness", "access_token": FB_PAGE_TOKEN,
+         "tasks": ["MANAGE", "CREATE_CONTENT"], "instagram_business_account": {"id": FAKE_IG_ID}},
+        {"id": "357154354459796", "name": "Dexter", "access_token": "EAAdexter000000000000000000000"},
+    ]})
+    return account
