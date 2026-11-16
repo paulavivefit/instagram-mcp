@@ -89,6 +89,22 @@ Or skip the env vars and call `add_account` at runtime (token goes to your OS ke
 
 > Publishing takes **public https media URLs** — Instagram fetches the bytes itself, so the image/video must be reachable on the open web (an S3/Cloudflare/any-CDN URL works).
 
+## Facebook Page server (facebook-mcp)
+
+The same package ships a second MCP server for a Facebook Page, using the same stored account (no extra token setup if the token has the Page permissions below).
+
+```json
+"facebook": {
+  "command": "/path/to/instagram-mcp/.venv/bin/facebook-mcp",
+  "env": { "FACEBOOK_MCP_ALLOWED_PAGE_IDS": "<your Page id>" }
+}
+```
+
+- **Page lock:** only Pages in `FACEBOOK_MCP_ALLOWED_PAGE_IDS` (comma separated) can be read or changed. Without it, only the Page linked to the Instagram account is allowed, never every Page on the token.
+- **Permissions:** pages_show_list, pages_read_engagement, pages_read_user_content, pages_manage_posts, pages_manage_engagement, read_insights. In development mode they work for app admins without App Review; commenter names stay hidden until App Review.
+- **Tools:** posts (list, get, top, scheduled, tagged), comments (with replies), Page and post stats, publishing text/link, photo albums and video (now, scheduled, or `dry_run`), edit/delete posts, comment, reply, hide/unhide, delete comments.
+- **Meta rules seen live:** a Page cannot hide its own comments (only other people's); impression metrics were retired in 2025 (use views/reach); some image hosts block Facebook's downloader.
+
 ## Multiple accounts
 
 Run one server for all your accounts (yours, a brand's, a client's). Each account authorizes its own token:

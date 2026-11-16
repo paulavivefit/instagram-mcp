@@ -117,7 +117,6 @@ def test_update_and_delete_post(fb_account):
 
 def test_comment_reply_unhide_delete(fb_account):
     fb_account.route("POST", rf"^/{POST}/comments$", {"id": "100_50"})
-    fb_account.route("GET", rf"^/{FB_PAGE_ID}_100$", {"id": POST})
     fb_account.route("POST", r"^/100_50/comments$", {"id": "100_51"})
     fb_account.route("POST", r"^/100_51$", {"success": True})
     fb_account.route("DELETE", r"^/100_51$", {"success": True})
@@ -155,7 +154,41 @@ def test_album_failure_cleans_up_uploaded_photos(fb_account):
 
 
 def test_hide_own_comment_explains_meta_rule(fb_account):
-    fb_account.route("GET", rf"^/{FB_PAGE_ID}_100$", {"id": POST})
     fb_account.route("POST", r"^/100_7$", (400, {"error": {"code": 200, "message": "Can not hide or unhide this comment"}}))
     out = call(_srv().hide_comment)(comment_id="100_7")
     assert out["error_class"] == "permission" and "other people" in out["hint"]
+
+
+def test_schedule_without_timezone_is_refused(fb_account):
+    naive = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S")
+    out = call(_srv().create_post)(message="x", scheduled_time=naive)
+    assert out["error_class"] == "validation" and "timezone" in out["error"]
+    out = call(_srv().create_post)(message="x", scheduled_time=naive + "Z")
+    assert out["error_class"] != "validation"
+
+
+def test_album_feed_failure_cleans_up_photos(fb_account):
+    ids = iter(["21", "22"])
+    fb_account.route("POST", rf"^/{FB_PAGE_ID}/photos$", lambda r: {"id": next(ids)})
+    fb_account.route("POST", rf"^/{FB_PAGE_ID}/feed$", (400, {"error": {"code": 100, "message": "bad time"}}))
+    fb_account.route("DELETE", r"^/2[12]$", {"success": True})
+    out = call(_srv().create_photo_post)(image_urls=["https://a.pl/1.jpg", "https://a.pl/2.jpg"])
+    assert out["ok"] is False and len(fb_account.calls("DELETE", r"^/2[12]$")) == 2
+
+
+def test_album_uncertain_feed_keeps_photos(fb_account):
+    import httpx
+    ids = iter(["31", "32"])
+    fb_account.route("POST", rf"^/{FB_PAGE_ID}/photos$", lambda r: {"id": next(ids)})
+    fb_account.route("POST", rf"^/{FB_PAGE_ID}/feed$", httpx.ReadTimeout("slow"))
+    out = call(_srv().create_photo_post)(image_urls=["https://a.pl/1.jpg", "https://a.pl/2.jpg"])
+    assert out["ok"] is False and out["photo_ids"] == ["31", "32"]
+    assert not fb_account.calls("DELETE", r".")
+
+
+def test_full_list_uses_small_pages(fb_account):
+    fb_account.route("GET", rf"^/{FB_PAGE_ID}/posts$", {"data": []})
+    call(_srv().list_posts)(limit="all")
+    call(_srv().list_posts)(limit="all", compact=True)
+    sizes = [r.params["limit"] for r in fb_account.calls("GET", r"/posts$")]
+    assert sizes == ["25", "100"]

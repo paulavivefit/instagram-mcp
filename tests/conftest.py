@@ -155,4 +155,7 @@ def fb_account(monkeypatch, account) -> FakeGraph:
          "tasks": ["MANAGE", "CREATE_CONTENT"], "instagram_business_account": {"id": FAKE_IG_ID}},
         {"id": "357154354459796", "name": "Dexter", "access_token": "EAAdexter000000000000000000000"},
     ]})
+    # ownership checks (GET <id>?fields=id,from): every "<page>_<n>" object is the Page's own
+    account.route("GET", rf"^/{FB_PAGE_ID}_\d+$",
+                  lambda r: {"id": r.path.strip("/"), "from": {"id": FB_PAGE_ID, "name": "Trening Fitness"}})
     return account

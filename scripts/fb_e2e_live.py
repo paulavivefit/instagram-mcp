@@ -133,12 +133,33 @@ def phase_comments(m: MCP, ctx: dict[str, Any]) -> None:
             r = m.call(P, "reply_to_comment", {"comment_id": cid, "message": E2E_TEXT}, lambda d: "replied")
             rid = r.get("comment_id")
             if rid:
-                m.call(P, "hide_comment", {"comment_id": rid}, lambda d: f"hidden={d['hidden']}")
-                m.call(P, "unhide_comment", {"comment_id": rid}, lambda d: f"hidden={d['hidden']}")
+                # Meta refuses hiding the Page's own comments: expect the explained refusal
+                m.call(P, "hide_comment", {"comment_id": rid}, expect_ok=False)
                 m.call(P, "delete_comment", {"comment_id": rid}, lambda d: f"deleted={d['deleted']}")
     finally:
         if cid:
             m.call(P, "delete_comment", {"comment_id": cid}, lambda d: f"deleted={d['deleted']}")
+
+
+def phase_hidevisitor(m: MCP, ctx: dict[str, Any]) -> None:
+    """Hide + immediately unhide ONE customer comment (approved by the user, ~2 s)."""
+    P = "hidevis"
+    posts = ctx.get("posts") or m.call(P, "list_posts", {"limit": 5}).get("posts", [])
+    for post in posts[:5]:
+        c = m.call(P, "get_comments", {"post_id": post["id"], "limit": 30, "include_replies": False},
+                   lambda d: f"{d['count']} comments")
+        pick = next((x for x in c.get("comments", []) if x.get("can_hide") and not x.get("is_hidden")
+                     and (x.get("from") or {}).get("id") != ctx.get("page_id")), None)
+        if pick:
+            h = m.call(P, "hide_comment", {"comment_id": pick["id"]}, lambda d: f"hidden={d['hidden']}")
+            try:
+                time.sleep(1)
+            finally:
+                m.call(P, "unhide_comment", {"comment_id": pick["id"]}, lambda d: f"hidden={d['hidden']}")
+            g = m.call(P, "get_comment", {"comment_id": pick["id"]},
+                       lambda d: f"is_hidden={d['comment']['is_hidden']}")
+            assert h is not None and g.get("comment", {}).get("is_hidden") is False, "comment left hidden!"
+            return
 
 
 def phase_publish(m: MCP, ctx: dict[str, Any]) -> None:
@@ -151,7 +172,7 @@ def phase_publish(m: MCP, ctx: dict[str, Any]) -> None:
         _delete(m, P, p.get("id"))
 
 
-PHASES = {"read": phase_read, "dryrun": phase_dryrun, "hidden": phase_hidden, "comments": phase_comments,
+PHASES = {"read": phase_read, "dryrun": phase_dryrun, "hidden": phase_hidden, "comments": phase_comments, "hidevisitor": phase_hidevisitor,
           "publish": phase_publish}
 
 
@@ -163,7 +184,7 @@ def main() -> int:
     ap.add_argument("--approve-publish", action="store_true")
     a = ap.parse_args()
     phases = [p.strip() for p in a.phases.split(",") if p.strip()]
-    if any(p in {"hidden", "comments"} for p in phases) and not a.approve:
+    if any(p in {"hidden", "comments", "hidevisitor"} for p in phases) and not a.approve:
         sys.exit("hidden/comments phases write to the Page: pass --approve")
     if "publish" in phases and not a.approve_publish:
         sys.exit("publish phase posts publicly: pass --approve-publish")

@@ -138,27 +138,38 @@ def validate_object_id(value: str, *, field: str) -> str:
     return v
 
 
+_FALLTHROUGH = {"not_found", "invalid_param", "permission"}
+
+
+def _check_owner(page: Page, obj_id: str, *, field: str) -> None:
+    """GET id,from and require Graph to echo the SAME id and the Page as author.
+
+    Graph may canonicalise an id to another object; trusting only the id we sent
+    would let "<our_page>_<foreign_story>" reach a foreign post.
+    """
+    try:
+        got = page.client.get(obj_id, fields="id,from")
+    except graph_client.GraphAPIError as exc:
+        if exc.error_class in _FALLTHROUGH:
+            raise graph_client.GraphAPIError(
+                f"{field} {obj_id} was not found on Page {page.name}.", error_class="not_found"
+            ) from exc
+        raise
+    owner = (got.get("from") or {}).get("id")
+    if str(got.get("id")) != obj_id or owner != page.id:
+        raise forbidden(str(owner or "unknown"))
+
+
 def assert_own_post(page: Page, post_id: str, *, field: str = "post_id") -> str:
     """A post/photo/video id that belongs to this Page. Raises forbidden_page otherwise.
 
-    "<page_id>_<n>" ids are checked locally; a bare numeric id (photo/video) is checked
-    via its `from` field.
+    "<page_id>_<n>" ids must carry this Page's id as prefix; every id is then confirmed
+    live (same id echoed back, authored by the Page).
     """
     pid = validate_object_id(post_id, field=field)
-    if "_" in pid:
-        if pid.split("_", 1)[0] != page.id:
-            raise forbidden(pid.split("_", 1)[0])
-        return pid
-    try:
-        owner = (page.client.get(pid, fields="from").get("from") or {}).get("id")
-    except graph_client.GraphAPIError as exc:
-        if exc.error_class in {"not_found", "invalid_param", "permission"}:
-            raise graph_client.GraphAPIError(
-                f"{field} {pid} was not found on Page {page.name}.", error_class="not_found"
-            ) from exc
-        raise
-    if owner != page.id:
-        raise forbidden(str(owner or "unknown"))
+    if "_" in pid and pid.split("_", 1)[0] != page.id:
+        raise forbidden(pid.split("_", 1)[0])
+    _check_owner(page, pid, field=field)
     return pid
 
 
@@ -170,10 +181,10 @@ def assert_own_comment(page: Page, comment_id: str) -> str:
     obj = cid.split("_", 1)[0]
     # The commented object is either the post "<page>_<obj>" or a photo/video <obj>.
     try:
-        page.client.get(f"{page.id}_{obj}", fields="id")
+        _check_owner(page, f"{page.id}_{obj}", field="comment_id")
         return cid
     except graph_client.GraphAPIError as exc:
-        if exc.error_class == "oauth":
+        if exc.error_class != "not_found":
             raise
-    assert_own_post(page, obj, field="comment_id")
+    _check_owner(page, obj, field="comment_id")
     return cid

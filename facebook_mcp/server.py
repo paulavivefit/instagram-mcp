@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
@@ -212,6 +213,10 @@ def _schedule(value: str | None) -> datetime | None:
         raise V.ValidationError(
             "scheduled_time needs a date AND time with timezone, e.g. 2026-11-20T18:00:00+01:00"
         )
+    if not re.search(r"(Z|[+-]\d{2}:?\d{2})$", value.strip()):
+        raise V.ValidationError(
+            "scheduled_time must include a timezone, e.g. 2026-11-20T18:00:00+01:00 (Polish winter time)"
+        )
     when = V.validate_date(value, field="scheduled_time")
     delta = when - _now()
     if delta < SCHEDULE_MIN:
@@ -370,7 +375,7 @@ def list_posts(
             f"{page.id}/posts",
             max_items=n,
             after=cursor,
-            page_size=100 if not compact else 100,
+            page_size=100 if compact else 25,  # full fields + summaries: big pages hit "reduce data"
             fields=COMPACT_POST_FIELDS if compact else POST_FIELDS,
             since=_epoch(s) if s else None,
             until=_epoch(u) if u else None,
@@ -809,7 +814,17 @@ def create_photo_post(
             raise
         for i, fbid in enumerate(ids):
             feed[f"attached_media[{i}]"] = json.dumps({"media_fbid": fbid})
-        out = _publish_result(page, page.client.post(f"{page.id}/feed", **feed), when)
+        try:
+            res = page.client.post(f"{page.id}/feed", **feed)
+        except graph_client.GraphAPIError as exc:
+            if exc.extra.get("uncertain"):
+                exc.extra["photo_ids"] = ids  # the post may exist: keep the photos, report them
+            else:
+                for fbid in ids:
+                    with contextlib.suppress(graph_client.GraphAPIError):
+                        page.client.delete(fbid)
+            raise
+        out = _publish_result(page, res, when)
         out["photo_ids"] = ids
         return out
 

@@ -67,7 +67,7 @@ def test_list_posts_all_refused_when_quota_high(fb_account):
 
 
 def test_get_post(fb_account):
-    fb_account.route("GET", rf"^/{POST}$", {**_post(100), "attachments": {"data": [{"type": "photo"}]}})
+    fb_account.route("GET", rf"^/{POST}$", {**_post(100), "from": {"id": FB_PAGE_ID}, "attachments": {"data": [{"type": "photo"}]}})
     out = call(_srv().get_post)(post_id=POST)
     assert out["post"]["attachments"] == [{"type": "photo"}]
 
@@ -93,7 +93,6 @@ def test_get_comments_no_note_when_authors_visible(fb_account):
 
 
 def test_get_comment_and_replies(fb_account):
-    fb_account.route("GET", rf"^/{FB_PAGE_ID}_100$", {"id": POST})
     fb_account.route("GET", r"^/100_1$", {"id": "100_1", "message": "hi", "from": {"id": "9"}})
     fb_account.route("GET", r"^/100_1/comments$", {"data": [{"id": "100_3", "from": {"id": "9"}}]})
     assert call(_srv().get_comment)(comment_id="100_1")["comment"]["message"] == "hi"

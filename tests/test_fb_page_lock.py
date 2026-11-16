@@ -90,7 +90,6 @@ def test_foreign_comment_refused(fb_account):
 
 
 def test_own_comment_accepted_via_post(fb_account):
-    fb_account.route("GET", rf"^/{FB_PAGE_ID}_555$", {"id": f"{FB_PAGE_ID}_555"})
     fb_account.route("POST", r"^/555_1$", {"success": True})
     out = call(_server().hide_comment)(comment_id="555_1")
     assert out["ok"] and out["hidden"] is True
@@ -123,3 +122,28 @@ def test_oauth_error_clears_page_cache(fb_account):
     assert out["error_class"] == "oauth"
     from facebook_mcp import pages
     assert pages._CACHE == {}
+
+
+def test_canonicalised_post_id_is_refused(fb_account):
+    """Graph answering a different id than asked must not count as ownership."""
+    fb_account.route("GET", rf"^/{FB_PAGE_ID}_42$", {"id": f"{OTHER_PAGE_ID}_42", "from": {"id": OTHER_PAGE_ID}})
+    assert call(_server().delete_post)(post_id=f"{FB_PAGE_ID}_42")["error_class"] == "forbidden_page"
+    assert not fb_account.calls("DELETE", r".")
+
+
+def test_post_with_our_prefix_but_foreign_author_is_refused(fb_account):
+    fb_account.route("GET", rf"^/{FB_PAGE_ID}_43$", {"id": f"{FB_PAGE_ID}_43", "from": {"id": "999"}})
+    assert call(_server().update_post)(post_id=f"{FB_PAGE_ID}_43", message="x")["error_class"] == "forbidden_page"
+
+
+def test_canonicalised_comment_object_is_refused(fb_account):
+    fb_account.route("GET", rf"^/{FB_PAGE_ID}_44$", {"id": f"{OTHER_PAGE_ID}_44", "from": {"id": OTHER_PAGE_ID}})
+    out = call(_server().reply_to_comment)(comment_id="44_1", message="x")
+    assert out["error_class"] == "forbidden_page"
+    assert not fb_account.calls("POST", r".")
+
+
+def test_transient_error_in_lock_check_is_not_masked(fb_account):
+    fb_account.route("GET", rf"^/{FB_PAGE_ID}_45$", (400, {"error": {"code": 4, "message": "Application request limit reached"}}))
+    out = call(_server().hide_comment)(comment_id="45_1")
+    assert out["error_class"] == "rate_limited"
