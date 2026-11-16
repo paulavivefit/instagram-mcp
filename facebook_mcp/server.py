@@ -903,11 +903,22 @@ def reply_to_comment(comment_id: CommentIdArg, message: MessageArg, page_id: Pag
     return _guard("reply_to_comment", {"comment_id": comment_id, "message": V.truncate(message, 80)}, _impl)
 
 
+HIDE_HINT = (
+    "Facebook only lets a Page hide comments written by other people, not the Page's own comments "
+    "(check can_hide in get_comments). Use delete_comment for the Page's own comments."
+)
+
+
 def _set_hidden(tool: str, comment_id: str, page_id: str | None, hidden: bool) -> dict[str, Any]:
     def _impl():
         page = P.resolve(page_id)
         cid = P.assert_own_comment(page, comment_id)
-        res = page.client.post(cid, is_hidden="true" if hidden else "false")
+        try:
+            res = page.client.post(cid, is_hidden="true" if hidden else "false")
+        except graph_client.GraphAPIError as exc:
+            if exc.error_class == "permission" and "hide" in str(exc).lower():
+                exc.extra.setdefault("hint", HIDE_HINT)
+            raise
         return _ok(page, comment_id=cid, hidden=hidden, success=bool(res.get("success", True)))
 
     return _guard(tool, {"comment_id": comment_id}, _impl)

@@ -152,3 +152,10 @@ def test_album_failure_cleans_up_uploaded_photos(fb_account):
     assert out["ok"] is False and "download" in out["hint"] and out["image_url"] == "https://b.pl/2.jpg"
     assert len(fb_account.calls("DELETE", r"^/11$")) == 1
     assert not fb_account.calls("POST", r"/feed$")
+
+
+def test_hide_own_comment_explains_meta_rule(fb_account):
+    fb_account.route("GET", rf"^/{FB_PAGE_ID}_100$", {"id": POST})
+    fb_account.route("POST", r"^/100_7$", (400, {"error": {"code": 200, "message": "Can not hide or unhide this comment"}}))
+    out = call(_srv().hide_comment)(comment_id="100_7")
+    assert out["error_class"] == "permission" and "other people" in out["hint"]
