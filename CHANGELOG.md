@@ -3,6 +3,17 @@
 All notable changes to instagram-mcp are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [0.4.0] — 2026-11-16
+
+New second server **facebook-mcp** (Facebook Page tools) in the same package; instagram-mcp itself is unchanged. 24 tools, 64 new tests (387 total), 97 % coverage on the new package; all 24 tools verified against the live Graph API, including scheduled, published and deleted posts and comment moderation.
+
+### Added
+- `facebook-mcp` entry point. Read: healthcheck, list_pages, get_page, list_posts, get_post, top_posts, list_scheduled_posts, list_tagged_posts, get_comments, get_comment, get_comment_replies, get_page_insights, get_post_insights, insights_summary. Write: create_post, create_photo_post (1-10 photos), create_video_post (each can schedule or dry_run), update_post, delete_post, comment_on_post, reply_to_comment, hide_comment, unhide_comment, delete_comment.
+- **Page lock**: only Pages in `FACEBOOK_MCP_ALLOWED_PAGE_IDS` (default: the Page linked to the Instagram account) are ever used. Tokens of other Pages are discarded; every post/comment id is confirmed live (same id echoed back, authored by the Page) before any read or write.
+- Shares the Keychain account, Graph client, audit scrubbing and validators with instagram-mcp; separate audit log `~/.claude/facebook-mcp/audit.log.jsonl`.
+- Insight metric names verified live (Meta retired impression metrics in 2025; using them returns a hint).
+- `scripts/fb_e2e_live.py`: real-API e2e over MCP stdio with read / dryrun / hidden / comments / hidevisitor / publish phases.
+
 ## [0.3.0] — 2026-11-13
 
 Driven by real use in Claude Desktop plus three independent reviews (correctness, performance, security). 34 tools, 311 tests, 97 % line coverage; every stage verified against the live Graph API.
